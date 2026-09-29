@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, CompleteSocialLoginRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, StartSocialLoginRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,36 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/social-login/start
+pub async fn start_social_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_social_login(
+        &payload.proxy_url,
+        payload.proxy_username,
+        payload.proxy_password,
+    ) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/social-login/complete
+pub async fn complete_social_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<CompleteSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .complete_social_login(&payload.callback_url)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

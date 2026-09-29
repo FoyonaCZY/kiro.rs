@@ -259,3 +259,26 @@ impl AdminErrorResponse {
         Self::new("internal_error", message)
     }
 }
+
+/// 生成 Social 授权链接
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginRequest {
+    pub proxy_url: String,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginResponse {
+    pub state: String,
+    pub authorization_url: String,
+}
+
+/// 用浏览器回调 URL 完成登录并添加凭据
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteSocialLoginRequest {
+    pub callback_url: String,
+}

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
+use super::social_login::{SocialLoginStore, exchange_social_code, parse_callback};
+
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
@@ -38,6 +40,7 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    social_logins: SocialLoginStore,
 }
 
 impl AdminService {
@@ -56,6 +59,7 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            social_logins: SocialLoginStore::default(),
         }
     }
 
@@ -256,6 +260,71 @@ impl AdminService {
             credential_id,
             email,
         })
+    }
+
+    pub fn start_social_login(
+        &self,
+        proxy_url: &str,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> Result<super::types::StartSocialLoginResponse, AdminServiceError> {
+        let started = self
+            .social_logins
+            .start(proxy_url, proxy_username, proxy_password)
+            .map_err(AdminServiceError::InvalidCredential)?;
+        Ok(super::types::StartSocialLoginResponse {
+            state: started.state,
+            authorization_url: started.authorization_url,
+        })
+    }
+
+    pub async fn complete_social_login(
+        &self,
+        callback_url: &str,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
+        let parsed = parse_callback(callback_url).map_err(AdminServiceError::InvalidCredential)?;
+        let pending = self
+            .social_logins
+            .take(&parsed.state)
+            .map_err(AdminServiceError::InvalidCredential)?;
+        let token = match exchange_social_code(self.token_manager.config(), &pending, &parsed).await
+        {
+            Ok(token) => token,
+            Err(err) => {
+                self.social_logins.restore(parsed.state, pending);
+                return Err(AdminServiceError::UpstreamError(err.to_string()));
+            }
+        };
+        tracing::info!(
+            login_option = %parsed.login_option,
+            has_profile = token.profile_arn.is_some(),
+            expires_in = token.expires_in,
+            access_token_len = token.access_token.len(),
+            "Social 登录换码成功"
+        );
+        let req = AddCredentialRequest {
+            refresh_token: Some(token.refresh_token),
+            auth_method: "social".to_string(),
+            client_id: None,
+            client_secret: None,
+            priority: 0,
+            region: None,
+            auth_region: None,
+            api_region: None,
+            machine_id: Some(pending.machine_id),
+            email: None,
+            proxy_url: Some(pending.proxy_url),
+            proxy_username: pending.proxy_username,
+            proxy_password: pending.proxy_password,
+            kiro_api_key: None,
+            endpoint: None,
+        };
+        let mut response = self.add_credential(req).await?;
+        response.message = format!(
+            "已通过 {} 登录并添加凭据，ID: {}",
+            parsed.login_option, response.credential_id
+        );
+        Ok(response)
     }
 
     /// 删除凭据

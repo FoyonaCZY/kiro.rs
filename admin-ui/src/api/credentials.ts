@@ -87,6 +87,27 @@ export async function addCredential(
   return data
 }
 
+export async function startSocialLogin(req: {
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+}): Promise<{ state: string; authorizationUrl: string }> {
+  const { data } = await api.post<{ state: string; authorizationUrl: string }>(
+    '/social-login/start',
+    req
+  )
+  return data
+}
+
+export async function completeSocialLogin(
+  callbackUrl: string
+): Promise<AddCredentialResponse> {
+  const { data } = await api.post<AddCredentialResponse>('/social-login/complete', {
+    callbackUrl,
+  })
+  return data
+}
+
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
