@@ -6,6 +6,7 @@ mod http_client;
 mod kiro;
 mod model;
 pub mod token;
+mod usage_log;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -158,10 +159,16 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
+    let usage = usage_log::UsageLog::open(
+        token_manager
+            .cache_dir()
+            .map(|dir| dir.join("usage.json")),
+    );
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        Some(usage.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -178,7 +185,8 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_usage(usage);
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

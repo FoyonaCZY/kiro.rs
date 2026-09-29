@@ -23,6 +23,53 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
+
+fn attach_usage(
+    usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    model: &str,
+    started: std::time::Instant,
+) -> Option<std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>> {
+    let usage = usage?;
+    let model = model.to_string();
+    let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Some(std::sync::Arc::new(move |input_tokens, output_tokens| {
+        if recorded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        usage.record(crate::usage_log::NewRequest {
+            model: model.clone(),
+            stream: true,
+            status: 200,
+            duration_ms: started.elapsed().as_millis() as u64,
+            input_tokens: input_tokens as i64,
+            output_tokens: output_tokens as i64,
+            error: None,
+        });
+    }))
+}
+
+fn record_usage_error(
+    usage: &Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    model: &str,
+    stream: bool,
+    started: std::time::Instant,
+    error: &anyhow::Error,
+    input_tokens: i32,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let message: String = error.to_string().chars().take(180).collect();
+    usage.record(crate::usage_log::NewRequest {
+        model: model.to_string(),
+        stream,
+        status: 502,
+        duration_ms: started.elapsed().as_millis() as u64,
+        input_tokens: input_tokens as i64,
+        output_tokens: 0,
+        error: Some(message),
+    });
+}
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -415,6 +462,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.usage.clone(),
         )
         .await
     } else {
@@ -427,6 +475,7 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            state.usage.clone(),
         )
         .await
     }
@@ -440,16 +489,24 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
 ) -> Response {
+    let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            record_usage_error(&usage, model, true, started, &e, input_tokens);
+            return map_provider_error(e);
+        }
     };
 
     // 创建流处理上下文
     let mut ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    if let Some(callback) = attach_usage(usage, model, started) {
+        ctx.set_on_usage(callback);
+    }
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -577,17 +634,30 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
 ) -> Response {
+    let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            record_usage_error(&usage, model, false, started, &e, input_tokens);
+            return map_provider_error(e);
+        }
     };
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
+            record_usage_error(
+                &usage,
+                model,
+                false,
+                started,
+                &anyhow::Error::msg(e.to_string()),
+                input_tokens,
+            );
             tracing::error!("读取响应体失败: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -749,6 +819,18 @@ async fn handle_non_stream_request(
             "output_tokens": output_tokens
         }
     });
+
+    if let Some(log) = &usage {
+        log.record(crate::usage_log::NewRequest {
+            model: model.to_string(),
+            stream: false,
+            status: 200,
+            duration_ms: started.elapsed().as_millis() as u64,
+            input_tokens: final_input_tokens as i64,
+            output_tokens: output_tokens as i64,
+            error: None,
+        });
+    }
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -938,6 +1020,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            state.usage.clone(),
         )
         .await
     } else {
@@ -950,6 +1033,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            state.usage.clone(),
         )
         .await
     }
@@ -966,20 +1050,28 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
 ) -> Response {
+    let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            record_usage_error(&usage, model, true, started, &e, estimated_input_tokens);
+            return map_provider_error(e);
+        }
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
     );
+    if let Some(callback) = attach_usage(usage, model, started) {
+        ctx.set_on_usage(callback);
+    }
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);

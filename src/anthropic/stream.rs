@@ -542,6 +542,7 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>>,
 }
 
 impl StreamContext {
@@ -568,7 +569,12 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            on_usage: None,
         }
+    }
+
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>) {
+        self.on_usage = Some(callback);
     }
 
     /// 生成 message_start 事件
@@ -1119,11 +1125,15 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let output_tokens = self.output_tokens;
+        if let Some(callback) = self.on_usage.clone() {
+            callback(final_input_tokens, output_tokens);
+        }
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(final_input_tokens, output_tokens),
         );
         events
     }
@@ -1166,6 +1176,10 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>) {
+        self.inner.on_usage = Some(callback);
     }
 
     /// 处理 Kiro 事件并缓冲结果

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::usage_log::UsageLog;
 
 use super::social_login::{SocialLoginStore, exchange_social_code, parse_callback};
 
@@ -41,6 +42,7 @@ pub struct AdminService {
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     social_logins: SocialLoginStore,
+    pub usage: Arc<UsageLog>,
 }
 
 impl AdminService {
@@ -53,6 +55,7 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let usage = UsageLog::open(token_manager.cache_dir().map(|dir| dir.join("usage.json")));
 
         Self {
             token_manager,
@@ -60,7 +63,13 @@ impl AdminService {
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             social_logins: SocialLoginStore::default(),
+            usage,
         }
+    }
+
+    pub fn with_usage(mut self, usage: Arc<UsageLog>) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// 获取所有凭据状态

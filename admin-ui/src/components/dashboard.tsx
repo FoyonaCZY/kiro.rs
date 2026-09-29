@@ -13,6 +13,8 @@ import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { RequestsPage } from '@/components/requests-page'
+import { PricesPage } from '@/components/prices-page'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -49,6 +51,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     return false
   })
+  const [page, setPage] = useState<'credentials' | 'requests' | 'prices'>('credentials')
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -544,8 +547,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">kiro.rs</p>
           <p className="mt-1 text-xl font-medium">管理台</p>
         </div>
-        <nav className="mt-8">
-          <div className="rounded-md bg-secondary px-3 py-2 text-sm">凭据</div>
+        <nav className="mt-8 space-y-1">
+          {([
+            ['credentials', '凭据'],
+            ['requests', '请求'],
+            ['prices', '价格'],
+          ] as const).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={`block w-full rounded-md px-3 py-2 text-left text-sm ${page === id ? 'bg-secondary' : 'text-muted-foreground hover:bg-secondary/60'}`}
+              onClick={() => setPage(id)}
+            >
+              {label}
+            </button>
+          ))}
         </nav>
       </aside>
       <div className="min-w-0 flex-1">
@@ -576,6 +592,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="px-4 py-6 md:px-8">
+        {page === 'requests' ? <RequestsPage /> : page === 'prices' ? <PricesPage /> : <>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -755,6 +772,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+        </>}
       </main>
 
       {/* 余额对话框 */}

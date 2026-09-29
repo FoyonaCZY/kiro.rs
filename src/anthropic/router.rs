@@ -8,6 +8,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
+use crate::usage_log::UsageLog;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -38,10 +39,14 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
+    usage: Option<std::sync::Arc<UsageLog>>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
+    }
+    if let Some(usage) = usage {
+        state = state.with_usage(usage);
     }
 
     // 需要认证的 /v1 路由

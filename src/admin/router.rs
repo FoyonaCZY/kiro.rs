@@ -12,6 +12,7 @@ use super::{
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
         start_social_login,
     },
+    usage_handlers::{delete_price, list_prices, list_requests, upsert_price, usage_summary},
     middleware::{AdminState, admin_auth_middleware},
 };
 
@@ -51,6 +52,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/social-login/start", post(start_social_login))
         .route("/social-login/complete", post(complete_social_login))
+        .route("/usage/requests", get(list_requests))
+        .route("/usage/summary", get(usage_summary))
+        .route("/usage/prices", get(list_prices).post(upsert_price))
+        .route("/usage/prices/{id}", delete(delete_price))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
