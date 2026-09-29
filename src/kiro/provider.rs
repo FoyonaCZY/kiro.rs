@@ -172,6 +172,10 @@ impl KiroProvider {
         }
     }
 
+    pub fn credential_ids(&self) -> Vec<u64> {
+        self.token_manager.credential_ids()
+    }
+
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint

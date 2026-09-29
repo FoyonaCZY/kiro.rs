@@ -13,6 +13,7 @@ import { SocialLoginDialog } from '@/components/social-login-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { AccessPage } from '@/components/access-page'
 import { RequestsPage } from '@/components/requests-page'
 import { PricesPage } from '@/components/prices-page'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
@@ -51,7 +52,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     return false
   })
-  const [page, setPage] = useState<'credentials' | 'requests' | 'prices'>('credentials')
+  const [page, setPage] = useState<'credentials' | 'access' | 'requests' | 'prices'>('credentials')
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -550,6 +551,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         <nav className="mt-8 space-y-1">
           {([
             ['credentials', '凭据'],
+            ['access', '接入'],
             ['requests', '请求'],
             ['prices', '价格'],
           ] as const).map(([id, label]) => (
@@ -592,7 +594,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="px-4 py-6 md:px-8">
-        {page === 'requests' ? <RequestsPage /> : page === 'prices' ? <PricesPage /> : <>
+        {page === 'requests' ? <RequestsPage /> : page === 'prices' ? <PricesPage /> : page === 'access' ? <AccessPage /> : <>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>

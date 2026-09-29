@@ -2,10 +2,14 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
+    access_handlers::{
+        create_group, create_key, delete_group, delete_key, list_groups, list_keys, rename_group,
+        set_members, update_key,
+    },
     handlers::{
         add_credential, complete_social_login, delete_credential, force_refresh_token,
         get_all_credentials, get_credential_balance, get_load_balancing_mode, reset_failure_count,
@@ -57,6 +61,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/summary", get(usage_summary))
         .route("/usage/prices", get(list_prices).post(upsert_price))
         .route("/usage/prices/{id}", delete(delete_price))
+        .route("/access/keys", get(list_keys).post(create_key))
+        .route("/access/keys/{id}", put(update_key).delete(delete_key))
+        .route("/access/groups", get(list_groups).post(create_group))
+        .route("/access/groups/{id}", put(rename_group).delete(delete_group))
+        .route("/access/groups/{id}/members", put(set_members))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

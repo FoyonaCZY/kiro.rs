@@ -43,6 +43,7 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     social_logins: SocialLoginStore,
     pub usage: Arc<UsageLog>,
+    pub access: Arc<crate::access::AccessStore>,
 }
 
 impl AdminService {
@@ -64,12 +65,22 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             social_logins: SocialLoginStore::default(),
             usage,
+            access: crate::access::AccessStore::open(None),
         }
     }
 
     pub fn with_usage(mut self, usage: Arc<UsageLog>) -> Self {
         self.usage = usage;
         self
+    }
+
+    pub fn with_access(mut self, access: Arc<crate::access::AccessStore>) -> Self {
+        self.access = access;
+        self
+    }
+
+    pub fn credential_ids(&self) -> Vec<u64> {
+        self.token_manager.credential_ids()
     }
 
     /// 获取所有凭据状态

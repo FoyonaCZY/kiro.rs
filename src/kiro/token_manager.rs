@@ -706,6 +706,12 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
+    pub fn credential_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self.entries.lock().iter().map(|entry| entry.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.entries
@@ -741,7 +747,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
 
         // 过滤可用凭据
-        let available: Vec<_> = entries.iter().filter(|e| e.is_available(model)).collect();
+        let available: Vec<_> = entries
+            .iter()
+            .filter(|e| e.is_available(model) && crate::access::credential_allowed(e.id))
+            .collect();
 
         if available.is_empty() {
             return None;
@@ -804,7 +813,11 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && e.is_available(model))
+                        .find(|e| {
+                            e.id == current_id
+                                && e.is_available(model)
+                                && crate::access::credential_allowed(e.id)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
@@ -848,7 +861,7 @@ impl MultiTokenManager {
                         let now = Instant::now();
                         if let Some(retry_after) = entries
                             .iter()
-                            .filter(|e| e.supports_model(model))
+                            .filter(|e| e.supports_model(model) && crate::access::credential_allowed(e.id))
                             .filter_map(|e| e.cooldown_until)
                             .filter_map(|until| until.checked_duration_since(now))
                             .min()

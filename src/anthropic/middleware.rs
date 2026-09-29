@@ -28,6 +28,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 请求和价格记录。未配置时不记录。
     pub usage: Option<Arc<UsageLog>>,
+    /// 接入 Key 和调度分组。未配置时仍使用单一 apiKey。
+    pub access: Option<Arc<crate::access::AccessStore>>,
 }
 
 impl AppState {
@@ -38,7 +40,13 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             usage: None,
+            access: None,
         }
+    }
+
+    pub fn with_access(mut self, access: Arc<crate::access::AccessStore>) -> Self {
+        self.access = Some(access);
+        self
     }
 
     /// 设置 KiroProvider
@@ -59,12 +67,28 @@ pub async fn auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
+    let Some(presented) = auth::extract_api_key(&request) else {
+        let error = ErrorResponse::authentication_error();
+        return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+    };
+    if let Some(access) = &state.access {
+        let Some(found) = access.authenticate(&presented) else {
             let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
-        }
+            return (StatusCode::UNAUTHORIZED, Json(error)).into_response();
+        };
+        let ids = state
+            .kiro_provider
+            .as_ref()
+            .map(|provider| provider.credential_ids())
+            .unwrap_or_default();
+        let allowed = access.allowed_credentials(&found.group_id, &ids);
+        return crate::access::run_with_credentials(allowed, next.run(request)).await;
+    }
+    if auth::constant_time_eq(&presented, &state.api_key) {
+        next.run(request).await
+    } else {
+        let error = ErrorResponse::authentication_error();
+        (StatusCode::UNAUTHORIZED, Json(error)).into_response()
     }
 }
 

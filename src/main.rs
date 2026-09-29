@@ -1,3 +1,4 @@
+mod access;
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -164,11 +165,18 @@ async fn main() {
             .cache_dir()
             .map(|dir| dir.join("usage.sqlite")),
     );
+    let access = access::AccessStore::open(
+        token_manager
+            .cache_dir()
+            .map(|dir| dir.join("access.sqlite")),
+    );
+    access.import_initial_key(&api_key);
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
         Some(usage.clone()),
+        Some(access.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -186,7 +194,8 @@ async fn main() {
         } else {
             let admin_service =
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
-                    .with_usage(usage);
+                    .with_usage(usage)
+                    .with_access(access);
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

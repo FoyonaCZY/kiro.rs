@@ -40,6 +40,7 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
     usage: Option<std::sync::Arc<UsageLog>>,
+    access: Option<std::sync::Arc<crate::access::AccessStore>>,
 ) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -47,6 +48,9 @@ pub fn create_router_with_provider(
     }
     if let Some(usage) = usage {
         state = state.with_usage(usage);
+    }
+    if let Some(access) = access {
+        state = state.with_access(access);
     }
 
     // 需要认证的 /v1 路由
