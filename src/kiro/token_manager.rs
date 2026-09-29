@@ -544,7 +544,7 @@ pub struct MultiTokenManager {
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
-    /// 是否为多凭据格式（数组格式才回写）
+    /// 是否为多凭据格式（数组写成数组，单对象写成对象）
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
@@ -581,7 +581,7 @@ impl MultiTokenManager {
     /// * `credentials` - 凭据列表
     /// * `proxy` - 可选的代理配置
     /// * `credentials_path` - 凭据文件路径（用于回写）
-    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `is_multiple_format` - 源文件是否为多凭据数组。回写时数组仍写数组，单对象仍写对象
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
@@ -979,7 +979,7 @@ impl MultiTokenManager {
                     }
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                // 回写凭据到文件，失败只记录警告
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
@@ -1013,23 +1013,17 @@ impl MultiTokenManager {
         })
     }
 
-    /// 将凭据列表回写到源文件
+    /// 将凭据回写到源文件。
     ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
+    /// 多凭据格式写成 JSON 数组。单对象格式在内存中仍只有一条凭据时写成 JSON 对象，
+    /// 不把原来的单对象文件改成数组。
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（无路径，或单对象文件在内存中已有多条凭据）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
 
         let path = match &self.credentials_path {
             Some(p) => p,
@@ -1051,8 +1045,18 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        // 单对象文件保持对象；内存里被追加过凭据时不改写，避免覆盖成数组。
+        let json = if self.is_multiple_format {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        } else if let [cred] = credentials.as_slice() {
+            serde_json::to_string_pretty(cred).context("序列化凭据失败")?
+        } else {
+            tracing::warn!(
+                "单对象凭据文件在内存中有 {} 条凭据，跳过回写以避免改变文件格式",
+                credentials.len()
+            );
+            return Ok(false);
+        };
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -2435,6 +2439,35 @@ mod tests {
         // 切换到下一个
         assert!(manager.switch_to_next());
         assert_ne!(manager.snapshot().current_id, initial_id);
+    }
+
+    #[test]
+    fn test_single_credential_file_persists_as_object() {
+        let path =
+            std::env::temp_dir().join(format!("kiro-single-cred-{}.json", uuid::Uuid::new_v4()));
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("social".to_string());
+        cred.refresh_token = Some("r".repeat(120));
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(path.clone()),
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].credentials.access_token = Some("updated-access-token".to_string());
+        }
+        assert!(manager.persist_credentials().unwrap());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.trim_start().starts_with('{'), "单对象文件不应写成数组");
+        let parsed: KiroCredentials = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.access_token.as_deref(), Some("updated-access-token"));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
