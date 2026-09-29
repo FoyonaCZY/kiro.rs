@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 const RETAIN_REQUESTS: i64 = 20_000;
 const PRUNE_EVERY: u64 = 100;
 const MAX_BLOB: usize = 256 * 1024;
+const LENGTH_ERROR_BLOB: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +117,7 @@ pub struct RequestDetail {
     pub outbound_headers: String,
     pub outbound_body: String,
     pub response_body: String,
+    pub payload_profile: String,
 }
 
 pub struct UsageLog {
@@ -174,6 +176,14 @@ impl UsageLog {
         let endpoint = clip(&request.endpoint, 80);
         let stop_reason = clip(&request.stop_reason, 80);
         let errors: i64 = if request.status >= 400 { 1 } else { 0 };
+        let length_error = error.as_deref().is_some_and(|err| {
+            err.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || err.contains("Input is too long")
+        });
+        let profile = payload_profile(&request.outbound_body);
+        if length_error {
+            tracing::warn!(profile = %profile, "上游拒绝：输入过长，字段长度");
+        }
+        let outbound_limit = if length_error { LENGTH_ERROR_BLOB } else { MAX_BLOB };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
             Err(err) => {
@@ -182,8 +192,8 @@ impl UsageLog {
             }
         };
         let inserted = tx.execute(
-            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 chrono::Utc::now().to_rfc3339(),
                 model,
@@ -200,8 +210,9 @@ impl UsageLog {
                 clip(&request.inbound_headers, MAX_BLOB),
                 clip(&request.inbound_body, MAX_BLOB),
                 clip(&request.outbound_headers, MAX_BLOB),
-                clip(&request.outbound_body, MAX_BLOB),
+                clip(&request.outbound_body, outbound_limit),
                 clip(&request.response_body, MAX_BLOB),
+                clip(&profile, 16 * 1024),
             ],
         );
         if let Err(err) = inserted {
@@ -286,7 +297,7 @@ impl UsageLog {
         let prices = load_prices(&conn).unwrap_or_default();
         let row = conn
             .query_row(
-                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body
+                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile
                  FROM requests WHERE id = ?1",
                 params![id as i64],
                 |row| {
@@ -311,6 +322,7 @@ impl UsageLog {
                         outbound_headers: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
                         outbound_body: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
                         response_body: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+                        payload_profile: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
                         view: RequestView {
                             cost_usd: charge(
                                 &prices,
@@ -487,6 +499,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "requests", "outbound_headers", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "outbound_body", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "response_body", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "payload_profile", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 
@@ -645,6 +658,224 @@ fn header_sensitive(name: &str) -> bool {
         || (name.contains("token") && name != "tokentype")
 }
 
+/// 出站请求的结构摘要。只记录路径、长度和图片尺寸，方便对照「Input is too long」落在哪一段。
+pub fn payload_profile(body: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return format!("bytes={} json=invalid", body.len());
+    };
+    let state = value.get("conversationState").unwrap_or(&value);
+    let mut images = 0usize;
+    let mut image_bytes = 0usize;
+    let mut tools = 0usize;
+    let mut tool_uses = 0usize;
+    let mut tool_results = 0usize;
+    let mut notable = Vec::new();
+    if let Some(history) = state.get("history").and_then(|item| item.as_array()) {
+        for (index, message) in history.iter().enumerate() {
+            notable.push(message_profile(index, message, &mut images, &mut image_bytes, &mut tools, &mut tool_uses, &mut tool_results));
+        }
+    }
+    if let Some(current) = state.get("currentMessage") {
+        notable.push(message_profile(usize::MAX, current, &mut images, &mut image_bytes, &mut tools, &mut tool_uses, &mut tool_results));
+    }
+    let history_len = state.get("history").and_then(|item| item.as_array()).map(|items| items.len()).unwrap_or(0);
+    let mut hits = Vec::new();
+    collect_large_strings(&value, "", &mut hits);
+    hits.sort_by(|left, right| right.1.cmp(&left.1));
+    hits.truncate(8);
+    notable.retain(|(_, score, _)| *score >= 2_000);
+    notable.sort_by(|left, right| right.1.cmp(&left.1));
+    notable.truncate(24);
+    notable.sort_by_key(|(index, _, _)| *index);
+    let mut lines = vec![format!(
+        "bytes={body_len} history={history_len} images={images} image_bytes={image_bytes} tools={tools} tool_uses={tool_uses} tool_results={tool_results}",
+        body_len = body.len(),
+    )];
+    for (path, len, note) in hits {
+        lines.push(format!("largest {path} {len}{note}"));
+    }
+    for (_, _, line) in notable {
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn message_profile(
+    index: usize,
+    message: &serde_json::Value,
+    images: &mut usize,
+    image_bytes: &mut usize,
+    tools: &mut usize,
+    tool_uses: &mut usize,
+    tool_results: &mut usize,
+) -> (usize, usize, String) {
+    let label = if index == usize::MAX { "current".to_string() } else { format!("m{index}") };
+    let sort = if index == usize::MAX { usize::MAX } else { index };
+    if let Some(user) = message.get("userInputMessage") {
+        let content = string_len(user, "content");
+        let (count, bytes, dims) = image_stats(user.get("images"));
+        *images += count;
+        *image_bytes += bytes;
+        let context = user.get("userInputMessageContext");
+        let tool_count = array_len(context.and_then(|item| item.get("tools")));
+        let (result_count, result_bytes) = text_stats(context.and_then(|item| item.get("toolResults")), &["content", "text"]);
+        *tools += tool_count;
+        *tool_results += result_count;
+        let score = content + bytes + result_bytes;
+        return (
+            sort,
+            score,
+            format!("{label} user content={content} images={count}/{bytes}{dims} tools={tool_count} tool_results={result_count}/{result_bytes}"),
+        );
+    }
+    if let Some(assistant) = message.get("assistantResponseMessage") {
+        let content = string_len(assistant, "content");
+        let uses = assistant.get("toolUses").and_then(|item| item.as_array());
+        let use_count = uses.map(|items| items.len()).unwrap_or(0);
+        let use_bytes = uses
+            .map(|items| items.iter().map(|item| serde_json::to_string(item.get("input").unwrap_or(&serde_json::Value::Null)).map(|text| text.len()).unwrap_or(0)).sum())
+            .unwrap_or(0);
+        *tool_uses += use_count;
+        return (
+            sort,
+            content + use_bytes,
+            format!("{label} assistant content={content} tool_uses={use_count}/{use_bytes}"),
+        );
+    }
+    (sort, 0, format!("{label} other"))
+}
+
+fn string_len(value: &serde_json::Value, key: &str) -> usize {
+    value.get(key).and_then(|item| item.as_str()).map(|text| text.len()).unwrap_or(0)
+}
+
+fn array_len(value: Option<&serde_json::Value>) -> usize {
+    value.and_then(|item| item.as_array()).map(|items| items.len()).unwrap_or(0)
+}
+
+fn image_stats(value: Option<&serde_json::Value>) -> (usize, usize, String) {
+    let Some(items) = value.and_then(|item| item.as_array()) else {
+        return (0, 0, String::new());
+    };
+    let mut bytes = 0usize;
+    let mut dims = Vec::new();
+    for image in items {
+        let data = image
+            .pointer("/source/bytes")
+            .or_else(|| image.get("bytes"))
+            .and_then(|item| item.as_str())
+            .unwrap_or("");
+        bytes += data.len();
+        if let Some((kind, width, height)) = image_meta(data) {
+            dims.push(format!("{kind} {width}x{height}"));
+        }
+    }
+    let note = if dims.is_empty() { String::new() } else { format!(" {}", dims.join(",")) };
+    (items.len(), bytes, note)
+}
+
+fn text_stats(value: Option<&serde_json::Value>, keys: &[&str]) -> (usize, usize) {
+    let Some(items) = value.and_then(|item| item.as_array()) else {
+        return (0, 0);
+    };
+    let bytes = items
+        .iter()
+        .map(|item| {
+            keys.iter().map(|key| string_len(item, key)).sum::<usize>().max(
+                item.get("content")
+                    .map(|content| serde_json::to_string(content).map(|text| text.len()).unwrap_or(0))
+                    .unwrap_or(0),
+            )
+        })
+        .sum();
+    (items.len(), bytes)
+}
+
+fn collect_large_strings(value: &serde_json::Value, path: &str, hits: &mut Vec<(String, usize, String)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let next = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                collect_large_strings(child, &next, hits);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_large_strings(child, &format!("{path}[{index}]"), hits);
+            }
+        }
+        serde_json::Value::String(text) if text.len() >= 256 => {
+            let note = if path.ends_with("bytes") {
+                image_meta(text).map(|(kind, width, height)| format!(" {kind} {width}x{height}")).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            hits.push((path.to_string(), text.len(), note));
+        }
+        _ => {}
+    }
+}
+
+fn image_meta(data: &str) -> Option<(&'static str, u32, u32)> {
+    let bytes = decode_b64_prefix(data, 128)?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some(("png", width, height));
+    }
+    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
+        let mut index = 2;
+        while index + 9 < bytes.len() {
+            if bytes[index] != 0xFF {
+                break;
+            }
+            let marker = bytes[index + 1];
+            if marker == 0xC0 || marker == 0xC1 || marker == 0xC2 {
+                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u32;
+                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u32;
+                return Some(("jpeg", width, height));
+            }
+            let len = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
+            if len < 2 {
+                break;
+            }
+            index += 2 + len;
+        }
+    }
+    None
+}
+
+fn decode_b64_prefix(data: &str, max_bytes: usize) -> Option<Vec<u8>> {
+    fn val(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let chars: Vec<u8> = data.bytes().filter(|byte| val(*byte).is_some()).take(max_bytes.div_ceil(3) * 4).collect();
+    if chars.len() < 4 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index + 4 <= chars.len() && out.len() < max_bytes {
+        let a = val(chars[index])?;
+        let b = val(chars[index + 1])?;
+        let c = val(chars[index + 2])?;
+        let d = val(chars[index + 3])?;
+        out.push((a << 2) | (b >> 4));
+        out.push((b << 4) | (c >> 2));
+        out.push((c << 6) | d);
+        index += 4;
+    }
+    out.truncate(max_bytes);
+    Some(out)
+}
+
 fn clip(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -769,5 +1000,20 @@ mod tests {
         assert!(detail.outbound_body.contains("conversationState"));
         assert!(detail.response_body.contains("hello"));
         assert!(!detail.inbound_headers.contains("secret"));
+        assert!(detail.payload_profile.contains("history=0"));
+    }
+
+    #[test]
+    fn payload_profile_names_the_largest_field_without_its_text() {
+        let long = "a".repeat(4000);
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let body = format!(
+            r#"{{"conversationState":{{"history":[{{"userInputMessage":{{"content":"{long}","images":[{{"format":"png","source":{{"bytes":"{png}"}}}}]}}}}],"currentMessage":{{"userInputMessage":{{"content":"hi"}}}}}}}}"#
+        );
+        let profile = payload_profile(&body);
+        assert!(profile.contains("largest conversationState.history[0].userInputMessage.content 4000"), "{profile}");
+        assert!(profile.contains("png 1x1"), "{profile}");
+        assert!(!profile.contains(&long), "{profile}");
+        assert!(profile.contains("m0 user"));
     }
 }

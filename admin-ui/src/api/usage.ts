@@ -37,6 +37,7 @@ export interface UsageRequestDetail extends UsageRequest {
   outboundHeaders: string
   outboundBody: string
   responseBody?: string
+  payloadProfile?: string
 }
 
 export interface ModelUsage {

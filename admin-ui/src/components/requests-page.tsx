@@ -209,6 +209,9 @@ function RequestDialog({ id, row, onClose }: { id: number | null; row?: UsageReq
           </div>
         ) : null}
         {row?.error ? <p className="text-sm text-destructive">{row.error}</p> : null}
+        {detail.data?.payloadProfile ? (
+          <pre className="max-h-40 overflow-auto rounded-md border bg-card p-3 font-mono text-xs leading-5">{detail.data.payloadProfile}</pre>
+        ) : null}
         {detail.isLoading ? <p className="text-sm text-muted-foreground">正在读取</p> : null}
         {detail.error ? <p className="text-sm text-destructive">{extractErrorMessage(detail.error)}</p> : null}
         {detail.data ? (
