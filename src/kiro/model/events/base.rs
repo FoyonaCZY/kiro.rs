@@ -12,6 +12,8 @@ pub enum EventType {
     AssistantResponse,
     /// 工具使用事件
     ToolUse,
+    /// 思维链事件
+    ReasoningContent,
     /// 计费事件
     Metering,
     /// 上下文使用率事件
@@ -26,6 +28,7 @@ impl EventType {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
+            "reasoningContentEvent" => Self::ReasoningContent,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             _ => Self::Unknown,
@@ -37,6 +40,7 @@ impl EventType {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::Unknown => "unknown",
@@ -67,6 +71,8 @@ pub enum Event {
     AssistantResponse(super::AssistantResponseEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
+    /// 思维链
+    ReasoningContent(super::ReasoningContentEvent),
     /// 计费
     Metering(()),
     /// 上下文使用率
@@ -115,6 +121,10 @@ impl Event {
             EventType::ToolUse => {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
+            }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
             }
             EventType::Metering => Ok(Self::Metering(())),
             EventType::ContextUsage => {
@@ -168,6 +178,10 @@ mod tests {
         );
         assert_eq!(EventType::from_str("toolUseEvent"), EventType::ToolUse);
         assert_eq!(EventType::from_str("meteringEvent"), EventType::Metering);
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::ReasoningContent
+        );
         assert_eq!(
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage

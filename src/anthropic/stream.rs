@@ -542,6 +542,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 由 reasoningContentEvent 打开的 thinking 块是否仍在接收内容
+    reasoning_block_open: bool,
     answer_text: String,
     thinking_text: String,
     on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>>,
@@ -571,6 +573,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            reasoning_block_open: false,
             answer_text: String::new(),
             thinking_text: String::new(),
             on_usage: None,
@@ -655,6 +658,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(reasoning) => self.process_reasoning(&reasoning.text),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
@@ -706,14 +710,96 @@ impl StreamContext {
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
 
+        // 正文开始，先关闭 reasoningContentEvent 打开的 thinking 块
+        let mut events = self.close_reasoning_block();
+
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
-            return self.process_content_with_thinking(content);
+            events.extend(self.process_content_with_thinking(content));
+            return events;
         }
 
         // 非 thinking 模式同样复用统一的 text_delta 发送逻辑，
         // 以便在 tool_use 自动关闭文本块后能够自愈重建新的文本块，避免“吞字”。
-        self.create_text_delta_events(content)
+        events.extend(self.create_text_delta_events(content));
+        events
+    }
+
+    /// 处理 reasoningContentEvent
+    ///
+    /// KRS 用这类事件单独流出思考内容，正文里不再带 `<thinking>` 标签。
+    /// 连续片段写进同一个 thinking 块，遇到正文、工具调用或流结束时关闭。
+    /// 客户端没有开启 thinking 时丢弃内容，只计入输出 token。
+    fn process_reasoning(&mut self, text: &str) -> Vec<SseEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.output_tokens += estimate_tokens(text);
+        if !self.thinking_enabled {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        // 已在 `<thinking>` 标签路径打开的块里，直接追加
+        if self.in_thinking_block {
+            if let Some(index) = self.thinking_block_index {
+                events.push(self.create_thinking_delta_event(index, text));
+            }
+            return events;
+        }
+
+        if !self.reasoning_block_open {
+            // 内容块必须顺序开闭：先关掉仍打开的文本块
+            if let Some(text_index) = self.text_block_index {
+                if self.state_manager.is_block_open_of_type(text_index, "text") {
+                    if let Some(stop) = self.state_manager.handle_content_block_stop(text_index) {
+                        events.push(stop);
+                    }
+                }
+            }
+
+            let index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(index);
+            self.reasoning_block_open = true;
+            events.extend(self.state_manager.handle_content_block_start(
+                index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "thinking",
+                        "thinking": ""
+                    }
+                }),
+            ));
+        }
+
+        if let Some(index) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(index, text));
+        }
+        events
+    }
+
+    /// 关闭 reasoningContentEvent 打开的 thinking 块
+    ///
+    /// 与标签路径的收尾保持一致：先发空的 thinking_delta，再发 content_block_stop。
+    /// 关闭后正文不再按 `<thinking>` 标签扫描。
+    fn close_reasoning_block(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if !self.reasoning_block_open {
+            return events;
+        }
+        self.reasoning_block_open = false;
+        self.thinking_extracted = true;
+        if let Some(index) = self.thinking_block_index {
+            events.push(self.create_thinking_delta_event(index, ""));
+            if let Some(stop) = self.state_manager.handle_content_block_stop(index) {
+                events.push(stop);
+            }
+        }
+        events
     }
 
     /// 处理包含thinking块的内容
@@ -952,6 +1038,8 @@ impl StreamContext {
 
         self.state_manager.set_has_tool_use(true);
 
+        events.extend(self.close_reasoning_block());
+
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
@@ -1070,6 +1158,8 @@ impl StreamContext {
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        events.extend(self.close_reasoning_block());
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -2024,5 +2114,135 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
         );
+    }
+
+    fn reasoning(text: &str) -> Event {
+        Event::ReasoningContent(serde_json::from_value(json!({ "text": text })).unwrap())
+    }
+
+    fn answer(text: &str) -> Event {
+        Event::AssistantResponse(serde_json::from_value(json!({ "content": text })).unwrap())
+    }
+
+    fn joined_delta(events: &[SseEvent], delta_type: &str, field: &str) -> String {
+        events
+            .iter()
+            .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == delta_type)
+            .filter_map(|e| e.data["delta"][field].as_str())
+            .collect()
+    }
+
+    /// 按 KRS 实测顺序：reasoningContentEvent 若干片，再 assistantResponseEvent。
+    #[test]
+    fn reasoning_events_become_one_thinking_block_before_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        for piece in ["17*23", " = 17*20", " + 17*3"] {
+            events.extend(ctx.process_kiro_event(&reasoning(piece)));
+        }
+        events.extend(ctx.process_kiro_event(&answer("391")));
+        events.extend(ctx.generate_final_events());
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| {
+                (
+                    e.data["index"].as_i64().unwrap(),
+                    e.data["content_block"]["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![(0, "thinking".to_string()), (1, "text".to_string())],
+            "one thinking block, then one text block"
+        );
+        assert_eq!(
+            joined_delta(&events, "thinking_delta", "thinking"),
+            "17*23 = 17*20 + 17*3"
+        );
+        assert_eq!(joined_delta(&events, "text_delta", "text"), "391");
+
+        let thinking_stop = events
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .expect("thinking block closed");
+        let text_start = events
+            .iter()
+            .position(|e| e.event == "content_block_start" && e.data["index"] == 1)
+            .unwrap();
+        assert!(thinking_stop < text_start, "thinking closes before text opens");
+
+        let message_delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn reasoning_block_closes_before_tool_use() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&reasoning("read the file first")));
+        events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "Read".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
+        events.extend(ctx.generate_final_events());
+
+        let thinking_stop = events
+            .iter()
+            .position(|e| e.event == "content_block_stop" && e.data["index"] == 0)
+            .expect("thinking block closed");
+        let tool_start = events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+            })
+            .unwrap();
+        assert!(thinking_stop < tool_start);
+        assert_eq!(
+            joined_delta(&events, "thinking_delta", "thinking"),
+            "read the file first"
+        );
+        let message_delta = events.iter().find(|e| e.event == "message_delta").unwrap();
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn reasoning_is_dropped_when_client_did_not_enable_thinking() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&reasoning("hidden")));
+        events.extend(ctx.process_kiro_event(&answer("391")));
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            events
+                .iter()
+                .all(|e| e.data["content_block"]["type"] != "thinking"
+                    && e.data["delta"]["type"] != "thinking_delta")
+        );
+        assert_eq!(joined_delta(&events, "text_delta", "text"), "391");
+        assert!(ctx.output_tokens > estimate_tokens("391"), "reasoning still counted");
+    }
+
+    /// 只有思维链、没有正文时，沿用已有规则补一个空格文本块
+    #[test]
+    fn reasoning_only_stream_still_gets_text_block() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&reasoning("thinking only")));
+        events.extend(ctx.generate_final_events());
+
+        let types: Vec<_> = events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .map(|e| e.data["content_block"]["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(types, vec!["thinking".to_string(), "text".to_string()]);
+        let stops = events.iter().filter(|e| e.event == "content_block_stop").count();
+        assert_eq!(stops, 2, "both blocks closed");
     }
 }
