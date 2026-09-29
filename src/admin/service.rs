@@ -56,7 +56,11 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
-        let usage = UsageLog::open(token_manager.cache_dir().map(|dir| dir.join("usage.sqlite")));
+        let usage = UsageLog::open(
+            token_manager
+                .cache_dir()
+                .map(|dir| dir.join("usage.sqlite")),
+        );
 
         Self {
             token_manager,
@@ -91,27 +95,39 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                cooldown_remaining_seconds: entry.cooldown_remaining_seconds,
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+            .map(|entry| {
+                let api_key = entry.api_key_hash.is_some()
+                    || entry.auth_method.as_deref().is_some_and(|method| {
+                        method.eq_ignore_ascii_case("api_key")
+                            || method.eq_ignore_ascii_case("apikey")
+                    });
+                let endpoint = crate::kiro::endpoint::effective_endpoint_name(
+                    entry.endpoint.as_deref(),
+                    &default_endpoint,
+                    api_key,
+                );
+                CredentialStatusItem {
+                    cooldown_remaining_seconds: entry.cooldown_remaining_seconds,
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint,
+                }
             })
             .collect();
 

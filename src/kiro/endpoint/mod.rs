@@ -12,8 +12,33 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod ide;
+pub mod krs;
 
 pub use ide::IdeEndpoint;
+pub use krs::KrsEndpoint;
+
+/// 凭据实际使用的端点。
+///
+/// OAuth 未显式指定时走 `krs`。配置里旧的 `defaultEndpoint: ide` 也按这个处理，
+/// 因为 Amazon Q 会在历史约 200 条时返回内容超限。API Key 只能走 `ide`。
+/// 凭据自己写了 `endpoint` 时保留原值，因此仍可把单个 OAuth 凭据固定在 Q。
+pub fn effective_endpoint_name(
+    explicit: Option<&str>,
+    default_endpoint: &str,
+    api_key: bool,
+) -> String {
+    if api_key {
+        return ide::IDE_ENDPOINT_NAME.to_string();
+    }
+    if let Some(name) = explicit.map(str::trim).filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+    let default_endpoint = default_endpoint.trim();
+    if default_endpoint.is_empty() || default_endpoint == ide::IDE_ENDPOINT_NAME {
+        return krs::KRS_ENDPOINT_NAME.to_string();
+    }
+    default_endpoint.to_string()
+}
 
 /// Kiro 端点
 ///
@@ -134,5 +159,18 @@ mod tests {
             "The bearer token included in the request is invalid"
         ));
         assert!(!default_is_bearer_token_invalid("unrelated error"));
+    }
+
+    #[test]
+    fn oauth_without_endpoint_uses_krs_even_when_config_says_ide() {
+        assert_eq!(effective_endpoint_name(None, "ide", false), "krs");
+        assert_eq!(effective_endpoint_name(Some("  "), "ide", false), "krs");
+        assert_eq!(effective_endpoint_name(Some("ide"), "krs", false), "ide");
+    }
+
+    #[test]
+    fn api_key_stays_on_q_endpoint() {
+        assert_eq!(effective_endpoint_name(None, "krs", true), "ide");
+        assert_eq!(effective_endpoint_name(Some("krs"), "krs", true), "ide");
     }
 }

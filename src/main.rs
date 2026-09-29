@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{IdeEndpoint, KiroEndpoint, KrsEndpoint, effective_endpoint_name};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -103,6 +103,8 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let krs = KrsEndpoint::new();
+        endpoints.insert(krs.name().to_string(), Arc::new(krs));
     }
 
     // 校验默认端点存在
@@ -113,11 +115,12 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
-        if !endpoints.contains_key(name) {
+        let name = effective_endpoint_name(
+            cred.endpoint.as_deref(),
+            &config.default_endpoint,
+            cred.is_api_key_credential(),
+        );
+        if !endpoints.contains_key(&name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
                 cred.id,

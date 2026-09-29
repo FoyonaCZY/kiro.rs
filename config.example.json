@@ -5,5 +5,5 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "krs"
 }

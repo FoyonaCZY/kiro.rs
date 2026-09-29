@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+use crate::kiro::endpoint::{KiroEndpoint, RequestContext, effective_endpoint_name};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CredentialsCoolingDown, MultiTokenManager};
@@ -147,11 +147,6 @@ impl KiroProvider {
         endpoint: &Arc<dyn KiroEndpoint>,
         machine_id: &str,
     ) -> UpstreamTarget {
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or(self.default_endpoint.as_str());
         let account = credentials
             .email
             .as_deref()
@@ -167,7 +162,7 @@ impl KiroProvider {
         };
         UpstreamTarget {
             account,
-            endpoint: name.to_string(),
+            endpoint: endpoint.name().to_string(),
             outbound_headers: crate::usage_log::encode_headers(endpoint.api_log_headers(&rctx)),
         }
     }
@@ -177,12 +172,13 @@ impl KiroProvider {
     }
 
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
-        let name = credentials
-            .endpoint
-            .as_deref()
-            .unwrap_or(&self.default_endpoint);
+        let name = effective_endpoint_name(
+            credentials.endpoint.as_deref(),
+            &self.default_endpoint,
+            credentials.is_api_key_credential(),
+        );
         self.endpoints
-            .get(name)
+            .get(&name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }

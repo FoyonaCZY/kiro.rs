@@ -192,7 +192,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `defaultEndpoint` | string | `krs` | 默认 Kiro 端点。OAuth 凭据未显式指定 `endpoint` 时使用 `krs`；旧值 `ide` 也会被 OAuth 当成 `krs`。API Key 固定走 `ide`。当前支持：`krs`、`ide` |
 
 完整配置示例：
 
@@ -246,7 +246,7 @@ docker-compose up
 | `proxyUrl`     | string | 凭据级代理 URL（可选，特殊值 `direct` 表示不使用代理）       |
 | `proxyUsername`| string | 凭据级代理用户名（可选）                                |
 | `proxyPassword`| string | 凭据级代理密码（可选）                                 |
-| `endpoint`     | string | 凭据级端点名称（可选，未配置时使用 `config.defaultEndpoint`）|
+| `endpoint`     | string | 凭据级端点。OAuth 省略时走 `krs`，写 `ide` 才固定走 Amazon Q。API Key 忽略该字段并走 `ide` |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
