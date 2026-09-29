@@ -1,0 +1,9 @@
+services:
+  kiro-rs:
+    image: kiro-rs:local
+    container_name: kiro-rs
+    ports:
+      - "127.0.0.1:8990:8990"
+    volumes:
+      - ./config:/app/config
+    restart: unless-stopped
