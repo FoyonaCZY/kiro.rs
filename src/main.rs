@@ -208,6 +208,8 @@ async fn main() {
                 admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
                     .with_usage(usage)
                     .with_access(access);
+            // 升级前的请求没有凭据 id，按 account 标签补进账号累计；已补过的不会重复计入
+            admin_service.backfill_account_usage();
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

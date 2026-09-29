@@ -16,7 +16,10 @@ use super::{
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
         start_social_login,
     },
-    usage_handlers::{delete_price, get_request, list_prices, list_requests, upsert_price, usage_summary},
+    usage_handlers::{
+        account_costs, delete_price, get_request, list_prices, list_requests, set_account_cost,
+        upsert_price, usage_summary,
+    },
     middleware::{AdminState, admin_auth_middleware},
 };
 
@@ -61,6 +64,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage/summary", get(usage_summary))
         .route("/usage/prices", get(list_prices).post(upsert_price))
         .route("/usage/prices/{id}", delete(delete_price))
+        .route("/usage/accounts", get(account_costs))
+        .route("/usage/accounts/{id}/cost", put(set_account_cost))
         .route("/access/keys", get(list_keys).post(create_key))
         .route("/access/keys/{id}", put(update_key).delete(delete_key))
         .route("/access/groups", get(list_groups).post(create_group))

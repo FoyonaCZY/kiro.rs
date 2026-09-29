@@ -6,6 +6,7 @@
 //! 开启模拟缓存后，input_tokens 只算未命中的输入，缓存读写单独成列；
 //! 缓存单价没填时按官方倍率：读 0.1x、5 分钟写 1.25x、1 小时写 2x 输入价。
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -50,6 +51,54 @@ pub struct Tokens {
     pub cache_read: i64,
     pub cache_write_5m: i64,
     pub cache_write_1h: i64,
+}
+
+/// 一个凭据的人民币成本和累计消耗。
+///
+/// 消耗每次读取时按当前单价重算，所以改单价后历史消耗和倍率立即跟着变。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCost {
+    pub credential_id: u64,
+    pub label: String,
+    /// 凭据已从配置里删除，只剩历史用量
+    pub removed: bool,
+    /// 手填的人民币成本。空表示未填，不参与倍率；0 表示免费账号
+    pub cost_cny: Option<f64>,
+    /// 按当前单价折算的累计消耗，美元
+    pub usage_usd: f64,
+    /// 成本 ¥ ÷ 消耗 $。成本或消耗为 0 时为空
+    pub cost_ratio: Option<f64>,
+    pub requests: u64,
+    pub errors: u64,
+    /// 模型没有单价、没算进消耗的成功请求数
+    pub unpriced_requests: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_5m_tokens: i64,
+    pub cache_write_1h_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCostReport {
+    pub accounts: Vec<AccountCost>,
+    /// 已填成本的账号数
+    pub costed_accounts: u64,
+    /// 已填成本之和，人民币
+    pub cost_cny: f64,
+    /// 已填成本账号的累计消耗，美元。合计倍率用它做分母
+    pub costed_usage_usd: f64,
+    /// 全部账号的累计消耗，美元
+    pub usage_usd: f64,
+    /// 合计成本 ¥ ÷ 已填成本账号的消耗 $
+    pub cost_ratio: Option<f64>,
+}
+
+/// 成本人民币 ÷ 消耗美元。不做汇率换算，只用来比较账号和定售价。
+fn cost_ratio(cost_cny: f64, usage_usd: f64) -> Option<f64> {
+    (cost_cny > 0.0 && usage_usd > 0.0).then(|| cost_cny / usage_usd)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +186,8 @@ struct LegacyFile {
 }
 
 pub struct NewRequest {
+    /// 实际用到的凭据；冷却、鉴权等没打到上游的请求为空
+    pub credential_id: Option<u64>,
     pub model: String,
     pub stream: bool,
     pub status: u16,
@@ -246,8 +297,8 @@ impl UsageLog {
             }
         };
         let inserted = tx.execute(
-            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, credential_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 chrono::Utc::now().to_rfc3339(),
                 model,
@@ -270,6 +321,7 @@ impl UsageLog {
                 cache_read,
                 cache_write_5m,
                 cache_write_1h,
+                request.credential_id.map(|id| id as i64),
             ],
         );
         if let Err(err) = inserted {
@@ -299,6 +351,28 @@ impl UsageLog {
         ) {
             tracing::warn!("累计用量失败: {}", err);
             return;
+        }
+        if let Some(credential_id) = request.credential_id {
+            // 账号消耗只算成功请求的 token，失败请求只记次数
+            let ok = errors == 0;
+            let billable = |value: i64| if ok { value } else { 0 };
+            if let Err(err) = add_account_totals(
+                &tx,
+                credential_id,
+                &total_key,
+                1,
+                errors,
+                Tokens {
+                    input: billable(input_tokens),
+                    output: billable(output_tokens),
+                    cache_read: billable(cache_read),
+                    cache_write_5m: billable(cache_write_5m),
+                    cache_write_1h: billable(cache_write_1h),
+                },
+            ) {
+                tracing::warn!("累计账号用量失败: {}", err);
+                return;
+            }
         }
         if let Err(err) = tx.commit() {
             tracing::warn!("提交用量失败: {}", err);
@@ -501,6 +575,218 @@ impl UsageLog {
         Ok(price)
     }
 
+    /// 设置账号人民币成本。None 表示清空（未知），0 表示免费账号，两者含义不同。
+    pub fn set_account_cost(&self, credential_id: u64, cost_cny: Option<f64>) -> Result<(), String> {
+        let conn = self.conn.lock();
+        match cost_cny {
+            None => {
+                conn.execute(
+                    "DELETE FROM account_costs WHERE credential_id = ?1",
+                    params![credential_id as i64],
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            Some(cost) => {
+                if !cost.is_finite() || cost < 0.0 {
+                    return Err("成本不能为负数".into());
+                }
+                conn.execute(
+                    "INSERT INTO account_costs(credential_id, cost_cny, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(credential_id) DO UPDATE SET cost_cny = excluded.cost_cny, updated_at = excluded.updated_at",
+                    params![credential_id as i64, cost, chrono::Utc::now().to_rfc3339()],
+                )
+                .map_err(|err| err.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 账号成本和累计消耗。`labels` 是当前配置里的凭据（id, 显示名）。
+    ///
+    /// 消耗每次都按当前单价从 token 重算，不存结果，所以改单价后历史消耗和倍率立即更新。
+    /// 已从配置删除但还有历史用量或成本的凭据也会列出，标为 removed。
+    pub fn account_report(&self, labels: &[(u64, String)]) -> AccountCostReport {
+        let conn = self.conn.lock();
+        let prices = load_prices(&conn).unwrap_or_default();
+        let mut costs: HashMap<u64, f64> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT credential_id, cost_cny FROM account_costs") {
+            if let Ok(rows) =
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)))
+            {
+                costs.extend(rows.flatten());
+            }
+        }
+        let mut totals: BTreeMap<u64, Vec<(String, i64, i64, Tokens)>> = BTreeMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT credential_id, model, requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens FROM account_totals",
+        ) {
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    Tokens {
+                        input: row.get(4)?,
+                        output: row.get(5)?,
+                        cache_read: row.get(6)?,
+                        cache_write_5m: row.get(7)?,
+                        cache_write_1h: row.get(8)?,
+                    },
+                ))
+            });
+            if let Ok(rows) = rows {
+                for (id, model, requests, errors, tokens) in rows.flatten() {
+                    totals.entry(id).or_default().push((model, requests, errors, tokens));
+                }
+            }
+        }
+
+        let mut order: Vec<(u64, String, bool)> =
+            labels.iter().map(|(id, label)| (*id, label.clone(), false)).collect();
+        let known: std::collections::HashSet<u64> = labels.iter().map(|(id, _)| *id).collect();
+        let mut orphans: Vec<u64> = totals
+            .keys()
+            .chain(costs.keys())
+            .copied()
+            .filter(|id| !known.contains(id))
+            .collect();
+        orphans.sort_unstable();
+        orphans.dedup();
+        order.extend(orphans.into_iter().map(|id| (id, format!("#{id}"), true)));
+
+        let mut accounts = Vec::with_capacity(order.len());
+        for (credential_id, label, removed) in order {
+            let mut row = AccountCost {
+                credential_id,
+                label,
+                removed,
+                cost_cny: costs.get(&credential_id).copied(),
+                usage_usd: 0.0,
+                cost_ratio: None,
+                requests: 0,
+                errors: 0,
+                unpriced_requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_5m_tokens: 0,
+                cache_write_1h_tokens: 0,
+            };
+            for (model, requests, errors, tokens) in totals.get(&credential_id).into_iter().flatten() {
+                row.requests += (*requests).max(0) as u64;
+                row.errors += (*errors).max(0) as u64;
+                row.input_tokens += tokens.input;
+                row.output_tokens += tokens.output;
+                row.cache_read_tokens += tokens.cache_read;
+                row.cache_write_5m_tokens += tokens.cache_write_5m;
+                row.cache_write_1h_tokens += tokens.cache_write_1h;
+                match charge(&prices, model, *tokens) {
+                    Some(cost) => row.usage_usd += cost,
+                    None => row.unpriced_requests += (*requests - *errors).max(0) as u64,
+                }
+            }
+            row.cost_ratio = row.cost_cny.and_then(|cost| cost_ratio(cost, row.usage_usd));
+            accounts.push(row);
+        }
+
+        let costed: Vec<&AccountCost> = accounts.iter().filter(|row| row.cost_cny.is_some()).collect();
+        let cost_cny: f64 = costed.iter().filter_map(|row| row.cost_cny).sum();
+        let costed_usage_usd: f64 = costed.iter().map(|row| row.usage_usd).sum();
+        AccountCostReport {
+            costed_accounts: costed.len() as u64,
+            cost_cny,
+            costed_usage_usd,
+            usage_usd: accounts.iter().map(|row| row.usage_usd).sum(),
+            cost_ratio: cost_ratio(cost_cny, costed_usage_usd),
+            accounts,
+        }
+    }
+
+    /// 升级前的请求没有 credential_id。按 account 标签（邮箱或 `#id`）找回凭据，
+    /// 回填 credential_id 并补进 account_totals。已回填的行不会再计入，可以反复调用。
+    pub fn backfill_accounts(&self, email_to_id: &HashMap<String, u64>) -> usize {
+        let conn = self.conn.lock();
+        let resolve = |label: &str| -> Option<u64> {
+            let label = label.trim();
+            if let Some(id) = label.strip_prefix('#').and_then(|id| id.parse().ok()) {
+                return Some(id);
+            }
+            email_to_id.get(label).copied()
+        };
+        let rows: Vec<(String, String, i64, Tokens)> = match conn.prepare(
+            "SELECT account, model, status, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens
+             FROM requests WHERE credential_id IS NULL AND account != ''",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        Tokens {
+                            input: row.get(3)?,
+                            output: row.get(4)?,
+                            cache_read: row.get(5)?,
+                            cache_write_5m: row.get(6)?,
+                            cache_write_1h: row.get(7)?,
+                        },
+                    ))
+                })
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!("读取待回填请求失败: {}", err);
+                return 0;
+            }
+        };
+        let mut grouped: HashMap<(u64, String), (i64, i64, Tokens)> = HashMap::new();
+        let mut labels: HashMap<String, u64> = HashMap::new();
+        for (account, model, status, tokens) in rows {
+            let Some(id) = resolve(&account) else { continue };
+            labels.insert(account, id);
+            let entry = grouped.entry((id, normalize_alias(&model))).or_default();
+            entry.0 += 1;
+            if status >= 400 {
+                entry.1 += 1;
+            } else {
+                entry.2.input += tokens.input.max(0);
+                entry.2.output += tokens.output.max(0);
+                entry.2.cache_read += tokens.cache_read.max(0);
+                entry.2.cache_write_5m += tokens.cache_write_5m.max(0);
+                entry.2.cache_write_1h += tokens.cache_write_1h.max(0);
+            }
+        }
+        if grouped.is_empty() {
+            return 0;
+        }
+        let result = (|| -> rusqlite::Result<usize> {
+            let tx = conn.unchecked_transaction()?;
+            for ((id, model), (requests, errors, tokens)) in &grouped {
+                add_account_totals(&tx, *id, model, *requests, *errors, *tokens)?;
+            }
+            let mut updated = 0;
+            for (account, id) in &labels {
+                updated += tx.execute(
+                    "UPDATE requests SET credential_id = ?1 WHERE credential_id IS NULL AND account = ?2",
+                    params![*id as i64, account],
+                )?;
+            }
+            tx.commit()?;
+            Ok(updated)
+        })();
+        match result {
+            Ok(updated) => {
+                tracing::info!(requests = updated, "已按凭据回填历史用量");
+                updated
+            }
+            Err(err) => {
+                tracing::warn!("回填账号用量失败: {}", err);
+                0
+            }
+        }
+    }
+
     pub fn delete_price(&self, id: &str) -> Result<(), String> {
         let conn = self.conn.lock();
         let changed = conn
@@ -558,6 +844,23 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_costs (
+            credential_id INTEGER PRIMARY KEY,
+            cost_cny REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_totals (
+            credential_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            requests INTEGER NOT NULL DEFAULT 0,
+            errors INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (credential_id, model)
         );",
     )?;
     ensure_column(conn, "requests", "account", "TEXT NOT NULL DEFAULT ''")?;
@@ -578,6 +881,42 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     for column in ["cache_read_per_m", "cache_write_5m_per_m", "cache_write_1h_per_m"] {
         ensure_column(conn, "prices", column, "REAL")?;
     }
+    ensure_column(conn, "requests", "credential_id", "INTEGER")?;
+    Ok(())
+}
+
+/// 按凭据×模型累计。模型名已归一化，与 model_totals 同一口径。
+fn add_account_totals(
+    conn: &Connection,
+    credential_id: u64,
+    model: &str,
+    requests: i64,
+    errors: i64,
+    tokens: Tokens,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO account_totals(credential_id, model, requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(credential_id, model) DO UPDATE SET
+           requests = requests + excluded.requests,
+           errors = errors + excluded.errors,
+           input_tokens = input_tokens + excluded.input_tokens,
+           output_tokens = output_tokens + excluded.output_tokens,
+           cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+           cache_write_5m_tokens = cache_write_5m_tokens + excluded.cache_write_5m_tokens,
+           cache_write_1h_tokens = cache_write_1h_tokens + excluded.cache_write_1h_tokens",
+        params![
+            credential_id as i64,
+            model,
+            requests,
+            errors,
+            tokens.input.max(0),
+            tokens.output.max(0),
+            tokens.cache_read.max(0),
+            tokens.cache_write_5m.max(0),
+            tokens.cache_write_1h.max(0)
+        ],
+    )?;
     Ok(())
 }
 
@@ -1043,6 +1382,7 @@ mod tests {
 
     fn sample(model: &str, status: u16) -> NewRequest {
         NewRequest {
+            credential_id: None,
             model: model.into(),
             stream: true,
             status,
@@ -1136,6 +1476,122 @@ mod tests {
         let summary = log.summary();
         assert_eq!(summary.unpriced_requests, 0);
         assert!(summary.cost_usd > 0.0);
+    }
+
+    fn on_credential(id: u64, model: &str, status: u16) -> NewRequest {
+        let mut request = sample(model, status);
+        request.credential_id = Some(id);
+        request.account = format!("#{id}");
+        request
+    }
+
+    fn account<'a>(report: &'a AccountCostReport, id: u64) -> &'a AccountCost {
+        report.accounts.iter().find(|row| row.credential_id == id).unwrap()
+    }
+
+    #[test]
+    fn account_usage_counts_only_successful_tokens_and_reprices_with_current_price() {
+        let log = UsageLog::open(None);
+        log.record(on_credential(1, "claude-opus-5-5", 200));
+        log.record(on_credential(1, "claude-opus-5-5", 502));
+        log.record(on_credential(2, "claude-opus-5-5", 200));
+        let labels = vec![(1, "a@example.com".to_string()), (2, "#2".to_string())];
+
+        // 还没定价：请求和 token 已记下，消耗为 0，未定价 1 条
+        let before = log.account_report(&labels);
+        let one = account(&before, 1);
+        assert_eq!((one.requests, one.errors, one.unpriced_requests), (2, 1, 1));
+        assert_eq!(one.input_tokens, 1000, "failed request tokens are not billed");
+        assert_eq!(one.usage_usd, 0.0);
+
+        // 定价后历史立即按新单价算：1000*15 + 500*75 = 52500 / 1e6
+        log.upsert_price(price()).unwrap();
+        let priced = log.account_report(&labels);
+        assert!((account(&priced, 1).usage_usd - 0.0525).abs() < 1e-9);
+        assert_eq!(account(&priced, 1).unpriced_requests, 0);
+
+        // 改单价（含缓存价）后再读，同一批历史按新单价重算
+        let mut cheaper = price();
+        cheaper.input_per_m = 3.0;
+        cheaper.output_per_m = 15.0;
+        cheaper.cache_read_per_m = Some(0.3);
+        log.upsert_price(cheaper).unwrap();
+        let repriced = log.account_report(&labels);
+        assert!((account(&repriced, 1).usage_usd - 0.0105).abs() < 1e-9, "{}", account(&repriced, 1).usage_usd);
+    }
+
+    #[test]
+    fn cost_ratio_is_cny_over_usd_and_ignores_unset_accounts() {
+        let log = UsageLog::open(None);
+        log.upsert_price(price()).unwrap();
+        for _ in 0..20 {
+            log.record(on_credential(1, "claude-opus-5-5", 200));
+        }
+        for _ in 0..20 {
+            log.record(on_credential(2, "claude-opus-5-5", 200));
+        }
+        log.record(on_credential(3, "claude-opus-5-5", 200));
+        let labels = vec![(1, "#1".to_string()), (2, "#2".to_string()), (3, "#3".to_string())];
+        // 每个账号 20 条 → 20 * 0.0525 = 1.05 美元
+        log.set_account_cost(1, Some(2.1)).unwrap();
+        log.set_account_cost(2, Some(0.0)).unwrap();
+        let report = log.account_report(&labels);
+        assert!((account(&report, 1).cost_ratio.unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(account(&report, 2).cost_ratio, None, "free account has no ratio");
+        assert_eq!(account(&report, 3).cost_cny, None);
+        assert_eq!(report.costed_accounts, 2);
+        assert!((report.cost_cny - 2.1).abs() < 1e-9);
+        // 合计：2.1 元 ÷（1.05+1.05）美元；未填成本的 #3 不进分母
+        assert!((report.costed_usage_usd - 2.1).abs() < 1e-9);
+        assert!((report.cost_ratio.unwrap() - 1.0).abs() < 1e-9);
+        assert!(report.usage_usd > report.costed_usage_usd);
+
+        assert!(log.set_account_cost(1, Some(-1.0)).is_err());
+        log.set_account_cost(1, None).unwrap();
+        assert_eq!(account(&log.account_report(&labels), 1).cost_cny, None);
+    }
+
+    #[test]
+    fn removed_credentials_keep_their_history() {
+        let log = UsageLog::open(None);
+        log.record(on_credential(9, "claude-opus-5-5", 200));
+        log.set_account_cost(9, Some(10.0)).unwrap();
+        let report = log.account_report(&[(1, "#1".to_string())]);
+        let gone = account(&report, 9);
+        assert!(gone.removed);
+        assert_eq!(gone.label, "#9");
+        assert_eq!(gone.cost_cny, Some(10.0));
+        assert!(!account(&report, 1).removed);
+    }
+
+    #[test]
+    fn backfill_maps_old_rows_by_label_once() {
+        let log = UsageLog::open(None);
+        // 升级前的记录：没有 credential_id，只有 account 标签
+        let mut by_email = sample("Claude-Opus-5-5", 200);
+        by_email.account = "a@example.com".into();
+        log.record(by_email);
+        let mut by_index = sample("claude-opus-5-5", 200);
+        by_index.account = "#2".into();
+        log.record(by_index);
+        let mut failed = sample("claude-opus-5-5", 502);
+        failed.account = "#2".into();
+        log.record(failed);
+        let mut unknown = sample("claude-opus-5-5", 200);
+        unknown.account = "gone@example.com".into();
+        log.record(unknown);
+
+        let emails = HashMap::from([("a@example.com".to_string(), 1u64)]);
+        assert_eq!(log.backfill_accounts(&emails), 3);
+        assert_eq!(log.backfill_accounts(&emails), 0, "second run adds nothing");
+
+        let labels = vec![(1, "a@example.com".to_string()), (2, "#2".to_string())];
+        let report = log.account_report(&labels);
+        assert_eq!(account(&report, 1).requests, 1);
+        assert_eq!(account(&report, 1).input_tokens, 1000, "model alias normalized");
+        assert_eq!((account(&report, 2).requests, account(&report, 2).errors), (2, 1));
+        assert_eq!(account(&report, 2).input_tokens, 1000);
+        assert_eq!(report.accounts.len(), 2, "unmapped label is left alone");
     }
 
     #[test]

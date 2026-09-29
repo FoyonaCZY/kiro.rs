@@ -62,6 +62,7 @@ fn logged_request(
     // input_tokens 是本次输入总数；开启模拟缓存时拆成未命中、缓存读、缓存写三部分入库
     let split = super::cache_emulation::usage_for_log(cache, input_tokens as i32);
     crate::usage_log::NewRequest {
+        credential_id: target.map(|item| item.credential_id),
         model: model.to_string(),
         stream,
         status,

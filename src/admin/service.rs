@@ -87,6 +87,48 @@ impl AdminService {
         self.token_manager.credential_ids()
     }
 
+    /// 当前凭据的 (id, 显示名)，显示名与请求记录里的 account 一致：有邮箱用邮箱，否则 `#id`
+    fn credential_labels(&self) -> Vec<(u64, String)> {
+        let mut labels: Vec<(u64, String)> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let label = entry
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|email| !email.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("#{}", entry.id));
+                (entry.id, label)
+            })
+            .collect();
+        labels.sort_by_key(|(id, _)| *id);
+        labels
+    }
+
+    /// 账号人民币成本、按当前单价重算的累计消耗和成本倍率
+    pub fn account_costs(&self) -> crate::usage_log::AccountCostReport {
+        self.usage.account_report(&self.credential_labels())
+    }
+
+    pub fn set_account_cost(&self, id: u64, cost_cny: Option<f64>) -> Result<(), String> {
+        self.usage.set_account_cost(id, cost_cny)
+    }
+
+    /// 把升级前没有凭据 id 的请求按 account 标签补进账号累计。可重复调用。
+    pub fn backfill_account_usage(&self) -> usize {
+        let emails = self
+            .credential_labels()
+            .into_iter()
+            .filter(|(_, label)| !label.starts_with('#'))
+            .map(|(id, label)| (label, id))
+            .collect();
+        self.usage.backfill_accounts(&emails)
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();

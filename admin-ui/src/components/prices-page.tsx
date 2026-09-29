@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { deletePrice, getPrices, getUsageSummary, savePrice, type ModelPrice } from '@/api/usage'
 import { PageHeader } from '@/components/page-header'
+import { AccountCosts } from '@/components/account-costs'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -36,17 +37,43 @@ export function PricesPage() {
   const [cacheReadPerM, setCacheReadPerM] = useState('')
   const [cacheWrite5mPerM, setCacheWrite5mPerM] = useState('')
   const [cacheWrite1hPerM, setCacheWrite1hPerM] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
     queryClient.invalidateQueries({ queryKey: ['usage-prices'] })
     queryClient.invalidateQueries({ queryKey: ['usage-requests'] })
+    queryClient.invalidateQueries({ queryKey: ['usage-request'] })
+    queryClient.invalidateQueries({ queryKey: ['usage-accounts'] })
+  }
+
+  const resetForm = () => {
+    setEditingId(null)
+    setName('')
+    setAliases('')
+    setInputPerM('')
+    setOutputPerM('')
+    setCacheReadPerM('')
+    setCacheWrite5mPerM('')
+    setCacheWrite1hPerM('')
+  }
+
+  const edit = (price: ModelPrice) => {
+    const text = (value?: number | null) => (value == null ? '' : String(value))
+    setEditingId(price.id)
+    setName(price.name)
+    setAliases(price.aliases.join(', '))
+    setInputPerM(String(price.inputPerM))
+    setOutputPerM(String(price.outputPerM))
+    setCacheReadPerM(text(price.cacheReadPerM))
+    setCacheWrite5mPerM(text(price.cacheWrite5mPerM))
+    setCacheWrite1hPerM(text(price.cacheWrite1hPerM))
   }
 
   const submit = async () => {
     const price: ModelPrice = {
-      id: '',
+      id: editingId ?? '',
       name: name.trim(),
       aliases: aliases.split(',').map((item) => item.trim()).filter(Boolean),
       inputPerM: Number(inputPerM),
@@ -67,15 +94,9 @@ export function PricesPage() {
     setSaving(true)
     try {
       await savePrice(price)
-      setName('')
-      setAliases('')
-      setInputPerM('')
-      setOutputPerM('')
-      setCacheReadPerM('')
-      setCacheWrite5mPerM('')
-      setCacheWrite1hPerM('')
+      resetForm()
       refresh()
-      toast.success('已保存定价')
+      toast.success(editingId ? '已更新定价，历史请求费用已按新单价重算' : '已保存定价，匹配别名的历史请求已按这个单价计费')
     } catch (error) {
       toast.error(extractErrorMessage(error))
     } finally {
@@ -86,6 +107,7 @@ export function PricesPage() {
   const remove = async (price: ModelPrice) => {
     try {
       await deletePrice(price.id)
+      if (editingId === price.id) resetForm()
       refresh()
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -98,7 +120,7 @@ export function PricesPage() {
     <div className="space-y-6">
       <PageHeader
         title="价格"
-        description="单价是每百万 token 的美元价格。开启模拟缓存后，缓存读写按缓存单价计费，留空时按输入价的 0.1x / 1.25x / 2x。未匹配到别名的请求费用显示为未定价。"
+        description="单价是每百万 token 的美元价格。开启模拟缓存后，缓存读写按缓存单价计费，留空时按输入价的 0.1x / 1.25x / 2x。费用不落库，每次都按当前单价从 token 重算，所以新增或修改单价（含缓存价）后，历史请求、汇总和账号倍率都会立即按新单价更新。未匹配到别名的请求显示为未定价。"
       />
 
       <div className="grid gap-4 md:grid-cols-5">
@@ -138,7 +160,10 @@ export function PricesPage() {
         <Input placeholder="缓存读 $/1M（留空 0.1x）" value={cacheReadPerM} onChange={(event) => setCacheReadPerM(event.target.value)} />
         <Input placeholder="5 分钟缓存写 $/1M（留空 1.25x）" value={cacheWrite5mPerM} onChange={(event) => setCacheWrite5mPerM(event.target.value)} />
         <Input placeholder="1 小时缓存写 $/1M（留空 2x）" value={cacheWrite1hPerM} onChange={(event) => setCacheWrite1hPerM(event.target.value)} />
-        <Button onClick={submit} disabled={saving}>保存</Button>
+        <div className="flex gap-2">
+          <Button className="flex-1" onClick={submit} disabled={saving}>{editingId ? '更新' : '保存'}</Button>
+          {editingId ? <Button variant="outline" onClick={resetForm} disabled={saving}>取消</Button> : null}
+        </div>
       </div>
 
       <div className="overflow-x-auto rounded-md border">
@@ -166,6 +191,7 @@ export function PricesPage() {
                 <td className="px-3 py-2">{cacheCell(price.cacheWrite5mPerM, price.inputPerM, 1.25)}</td>
                 <td className="px-3 py-2">{cacheCell(price.cacheWrite1hPerM, price.inputPerM, 2)}</td>
                 <td className="px-3 py-2 text-right">
+                  <Button variant="ghost" size="sm" onClick={() => edit(price)}>编辑</Button>
                   <Button variant="ghost" size="sm" onClick={() => remove(price)}>删除</Button>
                 </td>
               </tr>
@@ -209,6 +235,8 @@ export function PricesPage() {
           </table>
         </div>
       ) : null}
+
+      <AccountCosts />
     </div>
   )
 }

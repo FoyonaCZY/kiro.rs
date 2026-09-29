@@ -32,6 +32,8 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 一次上游调用选中的凭据。请求头里的访问令牌已经打码。
 #[derive(Debug, Clone)]
 pub struct UpstreamTarget {
+    /// 凭据 id，账号成本按它累计
+    pub credential_id: u64,
     pub account: String,
     pub endpoint: String,
     pub outbound_headers: String,
@@ -161,6 +163,7 @@ impl KiroProvider {
             config: self.token_manager.config(),
         };
         UpstreamTarget {
+            credential_id: id,
             account,
             endpoint: endpoint.name().to_string(),
             outbound_headers: crate::usage_log::encode_headers(endpoint.api_log_headers(&rctx)),

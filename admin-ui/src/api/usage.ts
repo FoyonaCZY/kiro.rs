@@ -110,3 +110,57 @@ export async function savePrice(price: ModelPrice): Promise<ModelPrice> {
 export async function deletePrice(id: string): Promise<void> {
   await api.delete(`/usage/prices/${encodeURIComponent(id)}`)
 }
+
+export interface AccountCost {
+  credentialId: number
+  label: string
+  /** 凭据已从配置删除，只剩历史用量 */
+  removed: boolean
+  /** 人民币成本；null 表示未填，不参与倍率；0 表示免费 */
+  costCny: number | null
+  /** 按当前单价折算的累计消耗，美元 */
+  usageUsd: number
+  /** 成本 ¥ ÷ 消耗 $ */
+  costRatio: number | null
+  requests: number
+  errors: number
+  unpricedRequests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWrite5mTokens: number
+  cacheWrite1hTokens: number
+}
+
+export interface AccountCostReport {
+  accounts: AccountCost[]
+  costedAccounts: number
+  costCny: number
+  costedUsageUsd: number
+  usageUsd: number
+  costRatio: number | null
+}
+
+export async function getAccountCosts(): Promise<AccountCostReport> {
+  const { data } = await api.get<AccountCostReport>('/usage/accounts')
+  return data
+}
+
+export async function setAccountCost(id: number, costCny: number | null): Promise<AccountCostReport> {
+  const { data } = await api.put<AccountCostReport>(`/usage/accounts/${id}/cost`, { costCny })
+  return data
+}
+
+export function formatCNY(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '—'
+  if (value === 0) return '¥0'
+  return Math.abs(value) < 0.01 ? `¥${value.toFixed(4)}` : `¥${value.toFixed(2)}`
+}
+
+/** 与 claude2api 一致：≥100 取整，≥10 一位小数，≥1 两位，其余四位 */
+export function formatCostRatio(value?: number | null): string {
+  if (value == null || Number.isNaN(value)) return '—'
+  const abs = Math.abs(value)
+  const body = abs >= 100 ? value.toFixed(0) : abs >= 10 ? value.toFixed(1) : abs >= 1 ? value.toFixed(2) : value.toFixed(4)
+  return `${body}×`
+}

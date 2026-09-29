@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use crate::usage_log::{ModelPrice, RequestView, UsageSummary};
+use crate::usage_log::{AccountCostReport, ModelPrice, RequestView, UsageSummary};
 
 use super::middleware::AdminState;
 
@@ -47,6 +47,29 @@ pub async fn delete_price(State(state): State<AdminState>, Path(id): Path<String
     match state.service.usage.delete_price(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => (StatusCode::NOT_FOUND, err).into_response(),
+    }
+}
+
+/// 账号人民币成本、按当前单价重算的累计消耗和成本倍率
+pub async fn account_costs(State(state): State<AdminState>) -> Json<AccountCostReport> {
+    Json(state.service.account_costs())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCostBody {
+    /// 人民币成本。null 表示清空（未知，不参与倍率），0 表示免费账号
+    pub cost_cny: Option<f64>,
+}
+
+pub async fn set_account_cost(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(body): Json<AccountCostBody>,
+) -> Response {
+    match state.service.set_account_cost(id, body.cost_cny) {
+        Ok(()) => (StatusCode::OK, Json(state.service.account_costs())).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
     }
 }
 
