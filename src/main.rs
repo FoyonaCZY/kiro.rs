@@ -162,6 +162,15 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    if config.cache_emulation.enabled {
+        tracing::info!(
+            read_ratio = config.cache_emulation.read_ratio,
+            creation_ratio = config.cache_emulation.creation_ratio,
+            "已开启模拟缓存计费"
+        );
+    }
+    anthropic::cache_emulation::init(config.cache_emulation.clone());
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let usage = usage_log::UsageLog::open(
         token_manager

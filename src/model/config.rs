@@ -107,6 +107,11 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_secs")]
     pub rate_limit_cooldown_secs: u64,
 
+    /// 模拟 prompt cache 计费（默认关闭）。开启后返回给客户端的 usage 带
+    /// cache_read/cache_creation，用量库按缓存价计费。上游请求不变。
+    #[serde(default)]
+    pub cache_emulation: CacheEmulationConfig,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -171,6 +176,35 @@ fn default_rate_limit_cooldown_secs() -> u64 {
     60
 }
 
+/// 模拟缓存配置
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEmulationConfig {
+    /// 是否开启
+    #[serde(default)]
+    pub enabled: bool,
+    /// 报给客户端的 cache_read 占模拟值的比例，0~1，少报的部分回到 input_tokens
+    #[serde(default = "default_cache_ratio")]
+    pub read_ratio: f64,
+    /// 报给客户端的 cache_creation 占模拟值的比例，0~1，少报的部分回到 input_tokens
+    #[serde(default = "default_cache_ratio")]
+    pub creation_ratio: f64,
+}
+
+impl Default for CacheEmulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            read_ratio: default_cache_ratio(),
+            creation_ratio: default_cache_ratio(),
+        }
+    }
+}
+
+fn default_cache_ratio() -> f64 {
+    1.0
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::krs::KRS_ENDPOINT_NAME.to_string()
 }
@@ -200,6 +234,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             rate_limit_cooldown_secs: default_rate_limit_cooldown_secs(),
+            cache_emulation: CacheEmulationConfig::default(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,

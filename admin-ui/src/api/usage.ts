@@ -29,6 +29,9 @@ export interface UsageRequest {
   endpoint?: string
   requestBytes?: number
   stopReason?: string
+  cacheReadTokens?: number
+  cacheWrite5mTokens?: number
+  cacheWrite1hTokens?: number
 }
 
 export interface UsageRequestDetail extends UsageRequest {
@@ -46,6 +49,9 @@ export interface ModelUsage {
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheReadTokens: number
+  cacheWrite5mTokens: number
+  cacheWrite1hTokens: number
   costUsd: number
 }
 
@@ -54,6 +60,9 @@ export interface UsageSummary {
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheReadTokens: number
+  cacheWrite5mTokens: number
+  cacheWrite1hTokens: number
   costUsd: number
   unpricedRequests: number
   byModel: ModelUsage[]
@@ -65,6 +74,12 @@ export interface ModelPrice {
   aliases: string[]
   inputPerM: number
   outputPerM: number
+  /** 空表示按输入价 0.1x */
+  cacheReadPerM?: number | null
+  /** 空表示按输入价 1.25x */
+  cacheWrite5mPerM?: number | null
+  /** 空表示按输入价 2x */
+  cacheWrite1hPerM?: number | null
 }
 
 export async function getUsageRequests(): Promise<UsageRequest[]> {

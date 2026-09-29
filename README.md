@@ -193,6 +193,9 @@ docker-compose up
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `rateLimitCooldownSecs` | number | `60` | 上游返回 429 且没有给出 `Retry-After` 时，凭据冷却的秒数 |
+| `cacheEmulation.enabled` | boolean | `false` | 模拟 prompt cache 计费。按 Anthropic 缓存规则估算命中，返回给客户端的 usage 带 `cache_read_input_tokens`/`cache_creation_input_tokens`，用量库按缓存单价计费。上游请求不变，状态只在内存里，按接入 Key 隔离 |
+| `cacheEmulation.readRatio` | number | `1.0` | 报给客户端的缓存读占模拟值的比例，0~1，少报的部分回到 `input_tokens` |
+| `cacheEmulation.creationRatio` | number | `1.0` | 报给客户端的缓存写占模拟值的比例，0~1，少报的部分回到 `input_tokens` |
 | `defaultEndpoint` | string | `krs` | 默认 Kiro 端点。OAuth 凭据未显式指定 `endpoint` 时使用 `krs`；旧值 `ide` 也会被 OAuth 当成 `krs`。API Key 固定走 `ide`。当前支持：`krs`、`ide` |
 
 完整配置示例：

@@ -140,10 +140,10 @@ export function RequestsPage() {
       {isLoading ? <p className="text-sm text-muted-foreground">加载中</p> : null}
       {error ? <p className="text-sm text-destructive">{extractErrorMessage(error)}</p> : null}
       <div className="overflow-x-auto rounded-md border">
-        <table className="w-full min-w-[980px] text-left text-sm">
+        <table className="w-full min-w-[1120px] text-left text-sm">
           <thead className="border-b bg-card text-muted-foreground">
             <tr>
-              {['时间', '账号', '模型', '方式', '状态', '耗时', '输入', '输出', '费用', ''].map((label) => (
+              {['时间', '账号', '模型', '方式', '状态', '耗时', '输入', '缓存读', '缓存写', '输出', '费用', ''].map((label) => (
                 <th key={label || 'action'} className="px-3 py-2 font-medium">{label}</th>
               ))}
             </tr>
@@ -158,6 +158,8 @@ export function RequestsPage() {
                 <td className={`px-3 py-2 ${statusClass(row.status)}`}>{row.status}{row.error ? <span className="ml-2 font-normal text-muted-foreground">{row.error}</span> : null}</td>
                 <td className="px-3 py-2">{duration(row.durationMs)}</td>
                 <td className="px-3 py-2">{row.inputTokens}</td>
+                <td className="px-3 py-2">{row.cacheReadTokens || '—'}</td>
+                <td className="px-3 py-2">{cacheWrite(row) || '—'}</td>
                 <td className="px-3 py-2">{row.outputTokens}</td>
                 <td className="px-3 py-2">{money(row.costUsd)}</td>
                 <td className="px-3 py-2 text-right">
@@ -166,7 +168,7 @@ export function RequestsPage() {
               </tr>
             ))}
             {data && rows.length === 0 ? (
-              <tr><td className="px-3 py-8 text-muted-foreground" colSpan={10}>没有符合筛选的请求。</td></tr>
+              <tr><td className="px-3 py-8 text-muted-foreground" colSpan={12}>没有符合筛选的请求。</td></tr>
             ) : null}
           </tbody>
         </table>
@@ -174,6 +176,15 @@ export function RequestsPage() {
       <RequestDialog id={selectedId} row={data?.find((item) => item.id === selectedId)} onClose={() => setSelectedId(null)} />
     </div>
   )
+}
+
+function cacheWrite(row: UsageRequest) {
+  return (row.cacheWrite5mTokens ?? 0) + (row.cacheWrite1hTokens ?? 0)
+}
+
+function cacheWriteLabel(row: UsageRequest) {
+  const h1 = row.cacheWrite1hTokens ?? 0
+  return h1 ? `${cacheWrite(row)}（1h ${h1}）` : String(cacheWrite(row))
 }
 
 function RequestDialog({ id, row, onClose }: { id: number | null; row?: UsageRequest; onClose: () => void }) {
@@ -193,11 +204,13 @@ function RequestDialog({ id, row, onClose }: { id: number | null; row?: UsageReq
           <DialogTitle>{row?.model ? `请求详情 · ${row.model}` : '请求详情'}</DialogTitle>
         </DialogHeader>
         {row ? (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
             {[
               ['状态', String(row.status)],
               ['耗时', duration(row.durationMs)],
               ['输入', String(row.inputTokens)],
+              ['缓存读', String(row.cacheReadTokens ?? 0)],
+              ['缓存写', cacheWriteLabel(row)],
               ['输出', String(row.outputTokens)],
               ['费用', money(row.costUsd)],
             ].map(([label, value]) => (

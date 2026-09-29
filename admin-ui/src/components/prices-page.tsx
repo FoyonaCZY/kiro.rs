@@ -12,6 +12,19 @@ function money(value: number) {
   return `$${value.toFixed(4)}`
 }
 
+/** 空字符串表示用默认倍率，返回 null；非法值返回 NaN */
+function optionalPrice(value: string): number | null {
+  const trimmed = value.trim()
+  return trimmed === '' ? null : Number(trimmed)
+}
+
+function cacheCell(value: number | null | undefined, input: number, multiplier: number) {
+  if (value === null || value === undefined) {
+    return <span className="text-muted-foreground">{`${+(input * multiplier).toFixed(6)}（默认 ${multiplier}x）`}</span>
+  }
+  return value
+}
+
 export function PricesPage() {
   const queryClient = useQueryClient()
   const summary = useQuery({ queryKey: ['usage-summary'], queryFn: getUsageSummary })
@@ -20,6 +33,9 @@ export function PricesPage() {
   const [aliases, setAliases] = useState('')
   const [inputPerM, setInputPerM] = useState('')
   const [outputPerM, setOutputPerM] = useState('')
+  const [cacheReadPerM, setCacheReadPerM] = useState('')
+  const [cacheWrite5mPerM, setCacheWrite5mPerM] = useState('')
+  const [cacheWrite1hPerM, setCacheWrite1hPerM] = useState('')
   const [saving, setSaving] = useState(false)
 
   const refresh = () => {
@@ -35,9 +51,17 @@ export function PricesPage() {
       aliases: aliases.split(',').map((item) => item.trim()).filter(Boolean),
       inputPerM: Number(inputPerM),
       outputPerM: Number(outputPerM),
+      cacheReadPerM: optionalPrice(cacheReadPerM),
+      cacheWrite5mPerM: optionalPrice(cacheWrite5mPerM),
+      cacheWrite1hPerM: optionalPrice(cacheWrite1hPerM),
     }
     if (!price.name || price.aliases.length === 0 || Number.isNaN(price.inputPerM) || Number.isNaN(price.outputPerM)) {
       toast.error('名称、别名和单价都要填')
+      return
+    }
+    const cachePrices = [price.cacheReadPerM, price.cacheWrite5mPerM, price.cacheWrite1hPerM]
+    if (cachePrices.some((value) => value !== null && value !== undefined && (Number.isNaN(value) || value < 0))) {
+      toast.error('缓存单价要是非负数字，或留空用默认倍率')
       return
     }
     setSaving(true)
@@ -47,6 +71,9 @@ export function PricesPage() {
       setAliases('')
       setInputPerM('')
       setOutputPerM('')
+      setCacheReadPerM('')
+      setCacheWrite5mPerM('')
+      setCacheWrite1hPerM('')
       refresh()
       toast.success('已保存定价')
     } catch (error) {
@@ -69,9 +96,12 @@ export function PricesPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="价格" description="单价是每百万 token 的美元价格。缓存不计入。未匹配到别名的请求费用显示为未定价。" />
+      <PageHeader
+        title="价格"
+        description="单价是每百万 token 的美元价格。开启模拟缓存后，缓存读写按缓存单价计费，留空时按输入价的 0.1x / 1.25x / 2x。未匹配到别名的请求费用显示为未定价。"
+      />
 
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-5">
         <Card>
           <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">请求</CardTitle></CardHeader>
           <CardContent className="text-2xl font-medium">{totals?.requests ?? '—'}</CardContent>
@@ -83,6 +113,12 @@ export function PricesPage() {
         <Card>
           <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">输入 / 输出</CardTitle></CardHeader>
           <CardContent className="text-2xl font-medium">{totals ? `${totals.inputTokens} / ${totals.outputTokens}` : '—'}</CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">缓存读 / 写</CardTitle></CardHeader>
+          <CardContent className="text-2xl font-medium">
+            {totals ? `${totals.cacheReadTokens} / ${totals.cacheWrite5mTokens + totals.cacheWrite1hTokens}` : '—'}
+          </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">估算费用</CardTitle></CardHeader>
@@ -98,10 +134,11 @@ export function PricesPage() {
         <Input placeholder="名称，例如 Opus" value={name} onChange={(event) => setName(event.target.value)} />
         <Input placeholder="别名，逗号分隔" value={aliases} onChange={(event) => setAliases(event.target.value)} />
         <Input placeholder="输入 $/1M" value={inputPerM} onChange={(event) => setInputPerM(event.target.value)} />
-        <div className="flex gap-2">
-          <Input placeholder="输出 $/1M" value={outputPerM} onChange={(event) => setOutputPerM(event.target.value)} />
-          <Button onClick={submit} disabled={saving}>保存</Button>
-        </div>
+        <Input placeholder="输出 $/1M" value={outputPerM} onChange={(event) => setOutputPerM(event.target.value)} />
+        <Input placeholder="缓存读 $/1M（留空 0.1x）" value={cacheReadPerM} onChange={(event) => setCacheReadPerM(event.target.value)} />
+        <Input placeholder="5 分钟缓存写 $/1M（留空 1.25x）" value={cacheWrite5mPerM} onChange={(event) => setCacheWrite5mPerM(event.target.value)} />
+        <Input placeholder="1 小时缓存写 $/1M（留空 2x）" value={cacheWrite1hPerM} onChange={(event) => setCacheWrite1hPerM(event.target.value)} />
+        <Button onClick={submit} disabled={saving}>保存</Button>
       </div>
 
       <div className="overflow-x-auto rounded-md border">
@@ -112,6 +149,9 @@ export function PricesPage() {
               <th className="px-3 py-2 font-medium">别名</th>
               <th className="px-3 py-2 font-medium">输入</th>
               <th className="px-3 py-2 font-medium">输出</th>
+              <th className="px-3 py-2 font-medium">缓存读</th>
+              <th className="px-3 py-2 font-medium">5 分钟写</th>
+              <th className="px-3 py-2 font-medium">1 小时写</th>
               <th className="px-3 py-2 font-medium"></th>
             </tr>
           </thead>
@@ -122,13 +162,16 @@ export function PricesPage() {
                 <td className="px-3 py-2">{price.aliases.join(', ')}</td>
                 <td className="px-3 py-2">{price.inputPerM}</td>
                 <td className="px-3 py-2">{price.outputPerM}</td>
+                <td className="px-3 py-2">{cacheCell(price.cacheReadPerM, price.inputPerM, 0.1)}</td>
+                <td className="px-3 py-2">{cacheCell(price.cacheWrite5mPerM, price.inputPerM, 1.25)}</td>
+                <td className="px-3 py-2">{cacheCell(price.cacheWrite1hPerM, price.inputPerM, 2)}</td>
                 <td className="px-3 py-2 text-right">
                   <Button variant="ghost" size="sm" onClick={() => remove(price)}>删除</Button>
                 </td>
               </tr>
             ))}
             {prices.data && prices.data.length === 0 ? (
-              <tr><td className="px-3 py-6 text-muted-foreground" colSpan={5}>还没有定价。</td></tr>
+              <tr><td className="px-3 py-6 text-muted-foreground" colSpan={8}>还没有定价。</td></tr>
             ) : null}
           </tbody>
         </table>
@@ -144,6 +187,8 @@ export function PricesPage() {
                 <th className="px-3 py-2 font-medium">失败</th>
                 <th className="px-3 py-2 font-medium">输入</th>
                 <th className="px-3 py-2 font-medium">输出</th>
+                <th className="px-3 py-2 font-medium">缓存读</th>
+                <th className="px-3 py-2 font-medium">缓存写</th>
                 <th className="px-3 py-2 font-medium">费用</th>
               </tr>
             </thead>
@@ -155,6 +200,8 @@ export function PricesPage() {
                   <td className="px-3 py-2">{row.errors}</td>
                   <td className="px-3 py-2">{row.inputTokens}</td>
                   <td className="px-3 py-2">{row.outputTokens}</td>
+                  <td className="px-3 py-2">{row.cacheReadTokens}</td>
+                  <td className="px-3 py-2">{row.cacheWrite5mTokens + row.cacheWrite1hTokens}</td>
                   <td className="px-3 py-2">{money(row.costUsd)}</td>
                 </tr>
               ))}

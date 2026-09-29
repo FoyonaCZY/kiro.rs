@@ -19,6 +19,7 @@ use crate::common::auth;
 struct RequestScope {
     group_id: String,
     allowed: HashSet<u64>,
+    key_id: Option<i64>,
 }
 
 task_local! {
@@ -41,7 +42,26 @@ pub fn credential_allowed(id: u64) -> bool {
         .unwrap_or(true)
 }
 
+/// 当前请求使用的接入 Key，模拟缓存按它隔离。
+pub fn current_key_id() -> Option<i64> {
+    REQUEST_SCOPE.try_with(|scope| scope.key_id).ok().flatten()
+}
+
+/// 不带接入 Key 的旧入口，只供测试构造分组作用域。
+#[cfg(test)]
 pub async fn run_with_credentials<F>(group_id: impl Into<String>, allowed: HashSet<u64>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    run_with_access_key(None, group_id, allowed, future).await
+}
+
+pub async fn run_with_access_key<F>(
+    key_id: Option<i64>,
+    group_id: impl Into<String>,
+    allowed: HashSet<u64>,
+    future: F,
+) -> F::Output
 where
     F: std::future::Future,
 {
@@ -50,6 +70,7 @@ where
             RequestScope {
                 group_id: group_id.into(),
                 allowed,
+                key_id,
             },
             future,
         )

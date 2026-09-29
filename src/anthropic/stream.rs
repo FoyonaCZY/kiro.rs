@@ -456,8 +456,7 @@ impl SseStateManager {
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
-        input_tokens: i32,
-        output_tokens: i32,
+        usage: serde_json::Value,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -486,10 +485,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage
                 }),
             ));
         }
@@ -547,6 +543,8 @@ pub struct StreamContext {
     answer_text: String,
     thinking_text: String,
     on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>>,
+    /// 模拟缓存的命中比例，None 表示未开启或本请求不可缓存
+    cache: Option<super::cache_emulation::CacheSplit>,
 }
 
 impl StreamContext {
@@ -577,11 +575,21 @@ impl StreamContext {
             answer_text: String::new(),
             thinking_text: String::new(),
             on_usage: None,
+            cache: None,
         }
     }
 
     pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>) {
         self.on_usage = Some(callback);
+    }
+
+    pub fn set_cache(&mut self, cache: Option<super::cache_emulation::CacheSplit>) {
+        self.cache = cache;
+    }
+
+    /// 给定输入总数，按模拟缓存拆出客户端看到的 usage
+    fn usage_json(&self, input_tokens: i32, output_tokens: i32) -> serde_json::Value {
+        super::cache_emulation::usage_json(self.cache.as_ref(), input_tokens, output_tokens)
     }
 
     fn assembled_response(&self) -> String {
@@ -607,10 +615,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": self.usage_json(self.input_tokens, 1)
             }
         })
     }
@@ -1246,9 +1251,10 @@ impl StreamContext {
         }
 
         // 生成最终事件
+        let usage = self.usage_json(final_input_tokens, output_tokens);
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, output_tokens),
+                .generate_final_events(usage),
         );
         events
     }
@@ -1297,6 +1303,10 @@ impl BufferedStreamContext {
         self.inner.on_usage = Some(callback);
     }
 
+    pub fn set_cache(&mut self, cache: Option<super::cache_emulation::CacheSplit>) {
+        self.inner.set_cache(cache);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1337,12 +1347,13 @@ impl BufferedStreamContext {
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 usage（开启模拟缓存时一并重算缓存拆分）
+        let corrected = self.inner.usage_json(final_input_tokens, 1);
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        *usage = corrected.clone();
                     }
                 }
             }
@@ -2244,5 +2255,84 @@ mod tests {
         assert_eq!(types, vec!["thinking".to_string(), "text".to_string()]);
         let stops = events.iter().filter(|e| e.event == "content_block_stop").count();
         assert_eq!(stops, 2, "both blocks closed");
+    }
+
+    fn usage_of<'a>(events: &'a [SseEvent], name: &str) -> &'a serde_json::Value {
+        let event = events.iter().find(|e| e.event == name).unwrap();
+        if name == "message_start" {
+            &event.data["message"]["usage"]
+        } else {
+            &event.data["usage"]
+        }
+    }
+
+    fn cached_input(usage: &serde_json::Value) -> i64 {
+        usage["input_tokens"].as_i64().unwrap()
+            + usage["cache_read_input_tokens"].as_i64().unwrap()
+            + usage["cache_creation_input_tokens"].as_i64().unwrap()
+    }
+
+    #[test]
+    fn stream_usage_carries_emulated_cache_when_enabled() {
+        super::super::cache_emulation::enable_for_test(1.0, 1.0);
+        let split = super::super::cache_emulation::CacheSplit {
+            read: 0.9,
+            creation: 0.08,
+            one_hour: false,
+        };
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5-5", 1000, false, HashMap::new());
+        ctx.set_cache(Some(split));
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&answer("hi")));
+        events.extend(ctx.process_kiro_event(&Event::ContextUsage(
+            serde_json::from_value(json!({ "contextUsagePercentage": 0.5 })).unwrap(),
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let start = usage_of(&events, "message_start");
+        assert_eq!(start["cache_read_input_tokens"], 900);
+        assert_eq!(start["cache_creation_input_tokens"], 80);
+        assert_eq!(start["input_tokens"], 20);
+        assert_eq!(cached_input(start), 1000);
+
+        // message_delta 用 contextUsageEvent 换算后的总数重新拆分
+        let delta = usage_of(&events, "message_delta");
+        let total = cached_input(delta);
+        assert!(total > 1000, "context usage should replace the estimate: {delta}");
+        assert_eq!(delta["cache_read_input_tokens"].as_i64().unwrap(), (total as f64 * 0.9).round() as i64);
+        assert_eq!(delta["cache_creation"]["ephemeral_5m_input_tokens"], delta["cache_creation_input_tokens"]);
+    }
+
+    #[test]
+    fn buffered_stream_corrects_message_start_with_cache_split() {
+        super::super::cache_emulation::enable_for_test(1.0, 1.0);
+        let mut ctx = BufferedStreamContext::new("claude-opus-5-5", 1000, false, HashMap::new());
+        ctx.set_cache(Some(super::super::cache_emulation::CacheSplit {
+            read: 0.5,
+            creation: 0.5,
+            one_hour: true,
+        }));
+        ctx.process_and_buffer(&answer("hi"));
+        ctx.process_and_buffer(&Event::ContextUsage(
+            serde_json::from_value(json!({ "contextUsagePercentage": 0.5 })).unwrap(),
+        ));
+        let events = ctx.finish_and_get_all_events();
+        let start = usage_of(&events, "message_start");
+        let delta = usage_of(&events, "message_delta");
+        assert_eq!(cached_input(start), cached_input(delta), "start and delta agree");
+        assert_eq!(start["cache_creation"]["ephemeral_1h_input_tokens"], start["cache_creation_input_tokens"]);
+        assert_eq!(start["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+    }
+
+    #[test]
+    fn stream_usage_unchanged_without_cache() {
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5-5", 1000, false, HashMap::new());
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&answer("hi")));
+        events.extend(ctx.generate_final_events());
+        let start = usage_of(&events, "message_start");
+        assert_eq!(*start, json!({ "input_tokens": 1000, "output_tokens": 1 }));
+        let delta = usage_of(&events, "message_delta");
+        assert_eq!(delta.as_object().unwrap().len(), 2, "{delta}");
     }
 }

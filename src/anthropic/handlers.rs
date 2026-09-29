@@ -57,14 +57,20 @@ fn logged_request(
     log_ctx: &RequestLogContext,
     target: Option<&crate::kiro::provider::UpstreamTarget>,
     response_body: &str,
+    cache: Option<&super::cache_emulation::CacheSplit>,
 ) -> crate::usage_log::NewRequest {
+    // input_tokens 是本次输入总数；开启模拟缓存时拆成未命中、缓存读、缓存写三部分入库
+    let split = super::cache_emulation::usage_for_log(cache, input_tokens as i32);
     crate::usage_log::NewRequest {
         model: model.to_string(),
         stream,
         status,
         duration_ms: started.elapsed().as_millis() as u64,
-        input_tokens,
+        input_tokens: split.input_tokens as i64,
         output_tokens,
+        cache_read_tokens: split.cache_read as i64,
+        cache_write_5m_tokens: split.cache_write_5m as i64,
+        cache_write_1h_tokens: split.cache_write_1h as i64,
         error,
         account: target
             .map(|item| item.account.clone())
@@ -90,6 +96,7 @@ fn attach_usage(
     started: std::time::Instant,
     log_ctx: RequestLogContext,
     target: crate::kiro::provider::UpstreamTarget,
+    cache: Option<super::cache_emulation::CacheSplit>,
 ) -> Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>> {
     let usage = usage?;
     let model = model.to_string();
@@ -110,6 +117,7 @@ fn attach_usage(
             &log_ctx,
             Some(&target),
             &response_body,
+            cache.as_ref(),
         ));
     }))
 }
@@ -149,6 +157,7 @@ fn record_usage_error(
         log_ctx,
         target,
         "",
+        None,
     ));
 }
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -547,6 +556,8 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    // 模拟缓存按客户端原始请求算前缀，必须在 body 被日志上下文拿走之前
+    let cache_profile = super::cache_emulation::profile(&body);
     let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
@@ -560,6 +571,7 @@ pub async fn post_messages(
             tool_name_map,
             state.usage.clone(),
             log_ctx,
+            cache_profile,
         )
         .await
     } else {
@@ -574,6 +586,7 @@ pub async fn post_messages(
             tool_name_map,
             state.usage.clone(),
             log_ctx,
+            cache_profile,
         )
         .await
     }
@@ -589,6 +602,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
+    cache_profile: Option<super::cache_emulation::CacheProfile>,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
@@ -604,7 +618,10 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
-    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target) {
+    // 上游已确认 2xx，此时才记下前缀，失败请求不会被当成已缓存
+    let cache = cache_profile.as_ref().map(super::cache_emulation::observe);
+    ctx.set_cache(cache);
+    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target, cache) {
         ctx.set_on_usage(callback);
     }
 
@@ -736,6 +753,7 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
+    cache_profile: Option<super::cache_emulation::CacheProfile>,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
@@ -748,6 +766,7 @@ async fn handle_non_stream_request(
     };
     let target = call.target;
     let response = call.response;
+    let cache = cache_profile.as_ref().map(super::cache_emulation::observe);
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -927,10 +946,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
-        }
+        "usage": super::cache_emulation::usage_json(cache.as_ref(), final_input_tokens, output_tokens)
     });
 
     if let Some(log) = &usage {
@@ -946,6 +962,7 @@ async fn handle_non_stream_request(
             &log_ctx,
             Some(&target),
             &response_body.to_string(),
+            cache.as_ref(),
         ));
     }
 
@@ -1141,6 +1158,8 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    // 模拟缓存按客户端原始请求算前缀，必须在 body 被日志上下文拿走之前
+    let cache_profile = super::cache_emulation::profile(&body);
     let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
@@ -1154,6 +1173,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             state.usage.clone(),
             log_ctx,
+            cache_profile,
         )
         .await
     } else {
@@ -1168,6 +1188,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             state.usage.clone(),
             log_ctx,
+            cache_profile,
         )
         .await
     }
@@ -1186,6 +1207,7 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
+    cache_profile: Option<super::cache_emulation::CacheProfile>,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
@@ -1213,7 +1235,9 @@ async fn handle_stream_request_buffered(
         thinking_enabled,
         tool_name_map,
     );
-    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target) {
+    let cache = cache_profile.as_ref().map(super::cache_emulation::observe);
+    ctx.set_cache(cache);
+    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target, cache) {
         ctx.set_on_usage(callback);
     }
 

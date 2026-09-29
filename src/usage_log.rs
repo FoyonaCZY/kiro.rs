@@ -2,7 +2,9 @@
 //!
 //! 明细和单价放在 SQLite。每条请求只插入一行，并累加模型汇总。
 //! 明细超过保留上限后删掉最旧的，汇总不删，所以请求变多也不会重写整份历史。
-//! token 数沿用代理里已有的估算，不是 Kiro 账单。价格按每百万 token 计算，不含缓存。
+//! token 数沿用代理里已有的估算，不是 Kiro 账单。价格按每百万 token 计算。
+//! 开启模拟缓存后，input_tokens 只算未命中的输入，缓存读写单独成列；
+//! 缓存单价没填时按官方倍率：读 0.1x、5 分钟写 1.25x、1 小时写 2x 输入价。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +19,9 @@ const RETAIN_REQUESTS: i64 = 20_000;
 const PRUNE_EVERY: u64 = 100;
 const MAX_BLOB: usize = 256 * 1024;
 const LENGTH_ERROR_BLOB: usize = 4 * 1024 * 1024;
+const CACHE_READ_MULTIPLIER: f64 = 0.1;
+const CACHE_WRITE_5M_MULTIPLIER: f64 = 1.25;
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +31,25 @@ pub struct ModelPrice {
     pub aliases: Vec<String>,
     pub input_per_m: f64,
     pub output_per_m: f64,
+    /// 缓存读单价，空表示按输入价 0.1x
+    #[serde(default)]
+    pub cache_read_per_m: Option<f64>,
+    /// 5 分钟缓存写单价，空表示按输入价 1.25x
+    #[serde(default)]
+    pub cache_write_5m_per_m: Option<f64>,
+    /// 1 小时缓存写单价，空表示按输入价 2x
+    #[serde(default)]
+    pub cache_write_1h_per_m: Option<f64>,
+}
+
+/// 一次请求或一组汇总的计费 token
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tokens {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write_5m: i64,
+    pub cache_write_1h: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +68,24 @@ pub struct RequestRecord {
     pub endpoint: String,
     pub request_bytes: u64,
     pub stop_reason: String,
+    #[serde(default)]
+    pub cache_read_tokens: i64,
+    #[serde(default)]
+    pub cache_write_5m_tokens: i64,
+    #[serde(default)]
+    pub cache_write_1h_tokens: i64,
+}
+
+impl RequestRecord {
+    fn tokens(&self) -> Tokens {
+        Tokens {
+            input: self.input_tokens,
+            output: self.output_tokens,
+            cache_read: self.cache_read_tokens,
+            cache_write_5m: self.cache_write_5m_tokens,
+            cache_write_1h: self.cache_write_1h_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +104,9 @@ pub struct ModelUsage {
     pub errors: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_5m_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub cost_usd: f64,
 }
 
@@ -72,6 +117,9 @@ pub struct UsageSummary {
     pub errors: u64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_5m_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub cost_usd: f64,
     pub unpriced_requests: u64,
     pub by_model: Vec<ModelUsage>,
@@ -100,6 +148,9 @@ pub struct NewRequest {
     pub endpoint: String,
     pub request_bytes: u64,
     pub stop_reason: String,
+    pub cache_read_tokens: i64,
+    pub cache_write_5m_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub inbound_headers: String,
     pub inbound_body: String,
     pub outbound_headers: String,
@@ -171,6 +222,9 @@ impl UsageLog {
         let total_key = normalize_alias(&model);
         let input_tokens = request.input_tokens.max(0);
         let output_tokens = request.output_tokens.max(0);
+        let cache_read = request.cache_read_tokens.max(0);
+        let cache_write_5m = request.cache_write_5m_tokens.max(0);
+        let cache_write_1h = request.cache_write_1h_tokens.max(0);
         let error = request.error.filter(|err| !err.is_empty());
         let account = clip(&request.account, 200);
         let endpoint = clip(&request.endpoint, 80);
@@ -192,8 +246,8 @@ impl UsageLog {
             }
         };
         let inserted = tx.execute(
-            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 chrono::Utc::now().to_rfc3339(),
                 model,
@@ -213,6 +267,9 @@ impl UsageLog {
                 clip(&request.outbound_body, outbound_limit),
                 clip(&request.response_body, MAX_BLOB),
                 clip(&profile, 16 * 1024),
+                cache_read,
+                cache_write_5m,
+                cache_write_1h,
             ],
         );
         if let Err(err) = inserted {
@@ -220,14 +277,25 @@ impl UsageLog {
             return;
         }
         if let Err(err) = tx.execute(
-            "INSERT INTO model_totals(model, requests, errors, input_tokens, output_tokens)
-             VALUES (?1, 1, ?2, ?3, ?4)
+            "INSERT INTO model_totals(model, requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(model) DO UPDATE SET
                requests = requests + 1,
                errors = errors + excluded.errors,
                input_tokens = input_tokens + excluded.input_tokens,
-               output_tokens = output_tokens + excluded.output_tokens",
-            params![total_key, errors, input_tokens, output_tokens],
+               output_tokens = output_tokens + excluded.output_tokens,
+               cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+               cache_write_5m_tokens = cache_write_5m_tokens + excluded.cache_write_5m_tokens,
+               cache_write_1h_tokens = cache_write_1h_tokens + excluded.cache_write_1h_tokens",
+            params![
+                total_key,
+                errors,
+                input_tokens,
+                output_tokens,
+                cache_read,
+                cache_write_5m,
+                cache_write_1h
+            ],
         ) {
             tracing::warn!("累计用量失败: {}", err);
             return;
@@ -255,8 +323,7 @@ impl UsageLog {
             }
         };
         let mut stmt = match conn.prepare(
-            "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason
-             FROM requests ORDER BY id DESC LIMIT ?1",
+            &format!("SELECT {RECORD_COLUMNS} FROM requests ORDER BY id DESC LIMIT ?1"),
         ) {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -264,29 +331,13 @@ impl UsageLog {
                 return Vec::new();
             }
         };
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(RequestRecord {
-                id: row.get::<_, i64>(0)? as u64,
-                time: row.get(1)?,
-                model: row.get(2)?,
-                stream: row.get::<_, i64>(3)? != 0,
-                status: row.get::<_, i64>(4)? as u16,
-                duration_ms: row.get::<_, i64>(5)? as u64,
-                input_tokens: row.get(6)?,
-                output_tokens: row.get(7)?,
-                error: row.get(8)?,
-                account: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                endpoint: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                request_bytes: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
-                stop_reason: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
-            })
-        });
+        let rows = stmt.query_map(params![limit], read_record);
         let Ok(rows) = rows else {
             return Vec::new();
         };
         rows.filter_map(|row| row.ok())
             .map(|record| RequestView {
-                cost_usd: charge(&prices, &record.model, record.input_tokens, record.output_tokens),
+                cost_usd: charge(&prices, &record.model, record.tokens()),
                 record,
             })
             .collect()
@@ -297,39 +348,25 @@ impl UsageLog {
         let prices = load_prices(&conn).unwrap_or_default();
         let row = conn
             .query_row(
-                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile
-                 FROM requests WHERE id = ?1",
+                &format!(
+                    "SELECT {RECORD_COLUMNS}, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body, payload_profile
+                     FROM requests WHERE id = ?1"
+                ),
                 params![id as i64],
                 |row| {
-                    let record = RequestRecord {
-                        id: row.get::<_, i64>(0)? as u64,
-                        time: row.get(1)?,
-                        model: row.get(2)?,
-                        stream: row.get::<_, i64>(3)? != 0,
-                        status: row.get::<_, i64>(4)? as u16,
-                        duration_ms: row.get::<_, i64>(5)? as u64,
-                        input_tokens: row.get(6)?,
-                        output_tokens: row.get(7)?,
-                        error: row.get(8)?,
-                        account: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
-                        endpoint: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                        request_bytes: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
-                        stop_reason: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    let record = read_record(row)?;
+                    let text = |index: usize| -> rusqlite::Result<String> {
+                        Ok(row.get::<_, Option<String>>(RECORD_COLUMN_COUNT + index)?.unwrap_or_default())
                     };
                     Ok(RequestDetail {
-                        inbound_headers: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                        inbound_body: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
-                        outbound_headers: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                        outbound_body: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
-                        response_body: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
-                        payload_profile: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+                        inbound_headers: text(0)?,
+                        inbound_body: text(1)?,
+                        outbound_headers: text(2)?,
+                        outbound_body: text(3)?,
+                        response_body: text(4)?,
+                        payload_profile: text(5)?,
                         view: RequestView {
-                            cost_usd: charge(
-                                &prices,
-                                &record.model,
-                                record.input_tokens,
-                                record.output_tokens,
-                            ),
+                            cost_usd: charge(&prices, &record.model, record.tokens()),
                             record,
                         },
                     })
@@ -344,7 +381,7 @@ impl UsageLog {
         let conn = self.conn.lock();
         let prices = load_prices(&conn).unwrap_or_default();
         let mut stmt = match conn.prepare(
-            "SELECT model, requests, errors, input_tokens, output_tokens FROM model_totals",
+            "SELECT model, requests, errors, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens FROM model_totals",
         ) {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -357,8 +394,13 @@ impl UsageLog {
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
+                Tokens {
+                    input: row.get(3)?,
+                    output: row.get(4)?,
+                    cache_read: row.get(5)?,
+                    cache_write_5m: row.get(6)?,
+                    cache_write_1h: row.get(7)?,
+                },
             ))
         });
         let Ok(rows) = rows else {
@@ -367,8 +409,8 @@ impl UsageLog {
         let mut by_model = Vec::new();
         let mut unpriced_requests = 0;
         for row in rows.flatten() {
-            let (model, requests, errors, input_tokens, output_tokens) = row;
-            let cost = charge(&prices, &model, input_tokens, output_tokens);
+            let (model, requests, errors, tokens) = row;
+            let cost = charge(&prices, &model, tokens);
             if cost.is_none() {
                 unpriced_requests += requests.max(0) as u64;
             }
@@ -376,8 +418,11 @@ impl UsageLog {
                 model,
                 requests: requests.max(0) as u64,
                 errors: errors.max(0) as u64,
-                input_tokens,
-                output_tokens,
+                input_tokens: tokens.input,
+                output_tokens: tokens.output,
+                cache_read_tokens: tokens.cache_read,
+                cache_write_5m_tokens: tokens.cache_write_5m,
+                cache_write_1h_tokens: tokens.cache_write_1h,
                 cost_usd: cost.unwrap_or(0.0),
             });
         }
@@ -387,6 +432,9 @@ impl UsageLog {
             errors: by_model.iter().map(|row| row.errors).sum(),
             input_tokens: by_model.iter().map(|row| row.input_tokens).sum(),
             output_tokens: by_model.iter().map(|row| row.output_tokens).sum(),
+            cache_read_tokens: by_model.iter().map(|row| row.cache_read_tokens).sum(),
+            cache_write_5m_tokens: by_model.iter().map(|row| row.cache_write_5m_tokens).sum(),
+            cache_write_1h_tokens: by_model.iter().map(|row| row.cache_write_1h_tokens).sum(),
             cost_usd: by_model.iter().map(|row| row.cost_usd).sum(),
             unpriced_requests,
             by_model,
@@ -409,6 +457,13 @@ impl UsageLog {
         if price.input_per_m < 0.0 || price.output_per_m < 0.0 {
             return Err("单价不能为负数".into());
         }
+        if [price.cache_read_per_m, price.cache_write_5m_per_m, price.cache_write_1h_per_m]
+            .iter()
+            .flatten()
+            .any(|value| *value < 0.0 || !value.is_finite())
+        {
+            return Err("缓存单价不能为负数".into());
+        }
         let conn = self.conn.lock();
         if price.id.is_empty() {
             price.id = uuid::Uuid::new_v4().to_string();
@@ -421,14 +476,26 @@ impl UsageLog {
         }
         let aliases = serde_json::to_string(&price.aliases).map_err(|err| err.to_string())?;
         conn.execute(
-            "INSERT INTO prices(id, name, aliases, input_per_m, output_per_m)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO prices(id, name, aliases, input_per_m, output_per_m, cache_read_per_m, cache_write_5m_per_m, cache_write_1h_per_m)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name,
                aliases = excluded.aliases,
                input_per_m = excluded.input_per_m,
-               output_per_m = excluded.output_per_m",
-            params![price.id, price.name, aliases, price.input_per_m, price.output_per_m],
+               output_per_m = excluded.output_per_m,
+               cache_read_per_m = excluded.cache_read_per_m,
+               cache_write_5m_per_m = excluded.cache_write_5m_per_m,
+               cache_write_1h_per_m = excluded.cache_write_1h_per_m",
+            params![
+                price.id,
+                price.name,
+                aliases,
+                price.input_per_m,
+                price.output_per_m,
+                price.cache_read_per_m,
+                price.cache_write_5m_per_m,
+                price.cache_write_1h_per_m
+            ],
         )
         .map_err(|err| err.to_string())?;
         Ok(price)
@@ -452,6 +519,9 @@ fn empty_summary() -> UsageSummary {
         errors: 0,
         input_tokens: 0,
         output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_5m_tokens: 0,
+        cache_write_1h_tokens: 0,
         cost_usd: 0.0,
         unpriced_requests: 0,
         by_model: Vec::new(),
@@ -500,7 +570,39 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "requests", "outbound_body", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "response_body", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "payload_profile", "TEXT NOT NULL DEFAULT ''")?;
+    for table in ["requests", "model_totals"] {
+        for column in ["cache_read_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens"] {
+            ensure_column(conn, table, column, "INTEGER NOT NULL DEFAULT 0")?;
+        }
+    }
+    for column in ["cache_read_per_m", "cache_write_5m_per_m", "cache_write_1h_per_m"] {
+        ensure_column(conn, "prices", column, "REAL")?;
+    }
     Ok(())
+}
+
+const RECORD_COLUMNS: &str = "id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens";
+const RECORD_COLUMN_COUNT: usize = 16;
+
+fn read_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRecord> {
+    Ok(RequestRecord {
+        id: row.get::<_, i64>(0)? as u64,
+        time: row.get(1)?,
+        model: row.get(2)?,
+        stream: row.get::<_, i64>(3)? != 0,
+        status: row.get::<_, i64>(4)? as u16,
+        duration_ms: row.get::<_, i64>(5)? as u64,
+        input_tokens: row.get(6)?,
+        output_tokens: row.get(7)?,
+        error: row.get(8)?,
+        account: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        endpoint: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+        request_bytes: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+        stop_reason: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+        cache_read_tokens: row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+        cache_write_5m_tokens: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+        cache_write_1h_tokens: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
+    })
 }
 
 fn ensure_column(
@@ -536,7 +638,9 @@ fn prune(conn: &Connection, retain: i64) -> rusqlite::Result<()> {
 }
 
 fn load_prices(conn: &Connection) -> rusqlite::Result<Vec<ModelPrice>> {
-    let mut stmt = conn.prepare("SELECT id, name, aliases, input_per_m, output_per_m FROM prices")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, name, aliases, input_per_m, output_per_m, cache_read_per_m, cache_write_5m_per_m, cache_write_1h_per_m FROM prices",
+    )?;
     let rows = stmt.query_map([], |row| {
         let aliases: String = row.get(2)?;
         Ok(ModelPrice {
@@ -545,6 +649,9 @@ fn load_prices(conn: &Connection) -> rusqlite::Result<Vec<ModelPrice>> {
             aliases: serde_json::from_str(&aliases).unwrap_or_default(),
             input_per_m: row.get(3)?,
             output_per_m: row.get(4)?,
+            cache_read_per_m: row.get(5)?,
+            cache_write_5m_per_m: row.get(6)?,
+            cache_write_1h_per_m: row.get(7)?,
         })
     })?;
     rows.collect()
@@ -622,11 +729,25 @@ fn import_legacy_json(conn: &Connection, sqlite_path: &Path) -> rusqlite::Result
     Ok(())
 }
 
-pub fn charge(prices: &[ModelPrice], model: &str, input_tokens: i64, output_tokens: i64) -> Option<f64> {
+pub fn charge(prices: &[ModelPrice], model: &str, tokens: Tokens) -> Option<f64> {
     let model = normalize_alias(model);
     let price = prices.iter().find(|price| price.aliases.iter().any(|alias| alias == &model))?;
     let million = 1_000_000.0;
-    Some(input_tokens.max(0) as f64 / million * price.input_per_m + output_tokens.max(0) as f64 / million * price.output_per_m)
+    let per = |count: i64, rate: f64| count.max(0) as f64 / million * rate;
+    let read = price.cache_read_per_m.unwrap_or(price.input_per_m * CACHE_READ_MULTIPLIER);
+    let write_5m = price
+        .cache_write_5m_per_m
+        .unwrap_or(price.input_per_m * CACHE_WRITE_5M_MULTIPLIER);
+    let write_1h = price
+        .cache_write_1h_per_m
+        .unwrap_or(price.input_per_m * CACHE_WRITE_1H_MULTIPLIER);
+    Some(
+        per(tokens.input, price.input_per_m)
+            + per(tokens.output, price.output_per_m)
+            + per(tokens.cache_read, read)
+            + per(tokens.cache_write_5m, write_5m)
+            + per(tokens.cache_write_1h, write_1h),
+    )
 }
 
 pub fn encode_headers<I, K, V>(headers: I) -> String
@@ -914,6 +1035,9 @@ mod tests {
             aliases: vec!["claude-opus-5-5".into()],
             input_per_m: 15.0,
             output_per_m: 75.0,
+            cache_read_per_m: None,
+            cache_write_5m_per_m: None,
+            cache_write_1h_per_m: None,
         }
     }
 
@@ -930,6 +1054,9 @@ mod tests {
             endpoint: "ide".into(),
             request_bytes: 128,
             stop_reason: "end_turn".into(),
+            cache_read_tokens: 0,
+            cache_write_5m_tokens: 0,
+            cache_write_1h_tokens: 0,
             inbound_headers: String::new(),
             inbound_body: String::new(),
             outbound_headers: String::new(),
@@ -940,9 +1067,61 @@ mod tests {
 
     #[test]
     fn charge_uses_alias_without_cache() {
-        let cost = charge(&[price()], "Claude-Opus-5-5", 1_000_000, 1_000_000).unwrap();
+        let plain = |input, output| Tokens {
+            input,
+            output,
+            ..Tokens::default()
+        };
+        let cost = charge(&[price()], "Claude-Opus-5-5", plain(1_000_000, 1_000_000)).unwrap();
         assert!((cost - 90.0).abs() < 0.0001);
-        assert!(charge(&[price()], "claude-haiku-4-5", 10, 10).is_none());
+        assert!(charge(&[price()], "claude-haiku-4-5", plain(10, 10)).is_none());
+    }
+
+    #[test]
+    fn cache_tokens_use_default_multipliers_or_explicit_prices() {
+        let tokens = Tokens {
+            input: 0,
+            output: 0,
+            cache_read: 1_000_000,
+            cache_write_5m: 1_000_000,
+            cache_write_1h: 1_000_000,
+        };
+        // 输入 15：读 1.5 + 5m 写 18.75 + 1h 写 30
+        let cost = charge(&[price()], "claude-opus-5-5", tokens).unwrap();
+        assert!((cost - 50.25).abs() < 0.0001, "{cost}");
+        let mut explicit = price();
+        explicit.cache_read_per_m = Some(1.0);
+        explicit.cache_write_5m_per_m = Some(2.0);
+        explicit.cache_write_1h_per_m = Some(3.0);
+        let cost = charge(&[explicit], "claude-opus-5-5", tokens).unwrap();
+        assert!((cost - 6.0).abs() < 0.0001, "{cost}");
+    }
+
+    #[test]
+    fn cache_tokens_are_stored_and_summed() {
+        let log = UsageLog::open(None);
+        let mut request = sample("claude-opus-5-5", 200);
+        request.input_tokens = 100;
+        request.cache_read_tokens = 9000;
+        request.cache_write_5m_tokens = 400;
+        request.cache_write_1h_tokens = 50;
+        log.record(request);
+        log.upsert_price(price()).unwrap();
+        let listed = &log.list(10)[0];
+        assert_eq!(listed.record.cache_read_tokens, 9000);
+        assert_eq!(listed.record.cache_write_5m_tokens, 400);
+        assert_eq!(listed.record.cache_write_1h_tokens, 50);
+        let detail = log.get(listed.record.id).unwrap();
+        assert_eq!(detail.view.record.cache_read_tokens, 9000);
+        let summary = log.summary();
+        assert_eq!(summary.cache_read_tokens, 9000);
+        assert_eq!(summary.by_model[0].cache_write_1h_tokens, 50);
+        // 100*15 + 500*75 + 9000*1.5 + 400*18.75 + 50*30，除以 1e6
+        let expected = (1500.0 + 37500.0 + 13500.0 + 7500.0 + 1500.0) / 1_000_000.0;
+        assert!((summary.cost_usd - expected).abs() < 1e-9, "{}", summary.cost_usd);
+        let mut negative = price();
+        negative.cache_read_per_m = Some(-1.0);
+        assert!(log.upsert_price(negative).is_err());
     }
 
     #[test]
