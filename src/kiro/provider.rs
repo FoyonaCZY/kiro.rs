@@ -265,7 +265,10 @@ impl KiroProvider {
             };
 
             let status = response.status();
-            let cooldown = Self::rate_limit_delay(response.headers());
+            let cooldown = Self::rate_limit_delay(
+                response.headers(),
+                Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs),
+            );
 
             // 成功响应
             if status.is_success() {
@@ -443,7 +446,10 @@ impl KiroProvider {
             };
 
             let status = response.status();
-            let cooldown = Self::rate_limit_delay(response.headers());
+            let cooldown = Self::rate_limit_delay(
+                response.headers(),
+                Duration::from_secs(self.token_manager.config().rate_limit_cooldown_secs),
+            );
 
             // 成功响应
             if status.is_success() {
@@ -633,7 +639,7 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
-    fn rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Duration {
+    fn rate_limit_delay(headers: &reqwest::header::HeaderMap, fallback: Duration) -> Duration {
         let kiro_delay = headers
             .get("x-amzn-kiro-ratelimit-retry-after")
             .and_then(|v| v.to_str().ok())
@@ -657,7 +663,7 @@ impl KiroProvider {
             });
         kiro_delay
             .or(standard_delay)
-            .unwrap_or(Duration::from_secs(60))
+            .unwrap_or(fallback)
             .clamp(Duration::from_secs(1), Duration::from_secs(86_400))
     }
 }

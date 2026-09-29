@@ -192,6 +192,7 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `rateLimitCooldownSecs` | number | `60` | 上游返回 429 且没有给出 `Retry-After` 时，凭据冷却的秒数 |
 | `defaultEndpoint` | string | `krs` | 默认 Kiro 端点。OAuth 凭据未显式指定 `endpoint` 时使用 `krs`；旧值 `ide` 也会被 OAuth 当成 `krs`。API Key 固定走 `ide`。当前支持：`krs`、`ide` |
 
 完整配置示例：

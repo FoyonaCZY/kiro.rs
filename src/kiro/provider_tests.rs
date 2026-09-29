@@ -124,36 +124,40 @@ async fn rate_limit_failover_covers_api_stream_and_mcp() {
 fn retry_after_headers_use_correct_units_and_precedence() {
     let mut headers = HeaderMap::new();
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(60)),
         Duration::from_secs(60)
+    );
+    assert_eq!(
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
+        Duration::from_secs(30)
     );
     headers.insert("retry-after", "120".parse().unwrap());
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
         Duration::from_secs(120)
     );
     headers.insert("x-amzn-kiro-ratelimit-retry-after", "1500".parse().unwrap());
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
         Duration::from_millis(1500)
     );
     headers.insert("x-amzn-kiro-ratelimit-retry-after", "bad".parse().unwrap());
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
         Duration::from_secs(120)
     );
     headers.insert("retry-after", "0".parse().unwrap());
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
         Duration::from_secs(1)
     );
     headers.insert("retry-after", u64::MAX.to_string().parse().unwrap());
     assert_eq!(
-        KiroProvider::rate_limit_delay(&headers),
+        KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30)),
         Duration::from_secs(86_400)
     );
     let future = chrono::Utc::now() + chrono::Duration::seconds(120);
     headers.insert("retry-after", future.to_rfc2822().parse().unwrap());
-    let delay = KiroProvider::rate_limit_delay(&headers);
+    let delay = KiroProvider::rate_limit_delay(&headers, Duration::from_secs(30));
     assert!(delay > Duration::from_secs(118) && delay <= Duration::from_secs(120));
 }
