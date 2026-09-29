@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react'
-import { KeyRound } from 'lucide-react'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -29,15 +28,13 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background p-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
-            <KeyRound className="h-6 w-6 text-primary" />
-          </div>
-          <CardTitle className="text-2xl">Kiro Admin</CardTitle>
+    <div className="min-h-screen flex items-center justify-center bg-background p-6">
+      <Card className="w-full max-w-md shadow-none">
+        <CardHeader>
+          <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">kiro.rs</p>
+          <CardTitle className="text-2xl font-medium">管理台</CardTitle>
           <CardDescription>
-            请输入 Admin API Key 以访问管理面板
+            输入 Admin API Key
           </CardDescription>
         </CardHeader>
         <CardContent>

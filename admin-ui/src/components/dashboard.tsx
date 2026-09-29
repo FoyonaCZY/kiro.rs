@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -538,14 +538,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }
 
   return (
-    <div className="min-h-screen bg-background">
-      {/* 顶部导航 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2">
-            <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
-          </div>
+    <div className="min-h-screen bg-background md:flex">
+      <aside className="border-b bg-card px-5 py-6 md:sticky md:top-0 md:flex md:h-screen md:w-56 md:shrink-0 md:flex-col md:border-b-0 md:border-r">
+        <div>
+          <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">kiro.rs</p>
+          <p className="mt-1 text-xl font-medium">管理台</p>
+        </div>
+        <nav className="mt-8">
+          <div className="rounded-md bg-secondary px-3 py-2 text-sm">凭据</div>
+        </nav>
+      </aside>
+      <div className="min-w-0 flex-1">
+      <header className="sticky top-0 z-50 border-b bg-background/95 backdrop-blur">
+        <div className="flex h-14 items-center justify-end gap-2 px-4 md:px-8">
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
@@ -570,7 +575,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
+      <main className="px-4 py-6 md:px-8">
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -791,6 +796,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+      </div>
     </div>
   )
 }
