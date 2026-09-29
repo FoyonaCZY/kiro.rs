@@ -55,7 +55,7 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
-        let usage = UsageLog::open(token_manager.cache_dir().map(|dir| dir.join("usage.json")));
+        let usage = UsageLog::open(token_manager.cache_dir().map(|dir| dir.join("usage.sqlite")));
 
         Self {
             token_manager,

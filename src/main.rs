@@ -162,7 +162,7 @@ async fn main() {
     let usage = usage_log::UsageLog::open(
         token_manager
             .cache_dir()
-            .map(|dir| dir.join("usage.json")),
+            .map(|dir| dir.join("usage.sqlite")),
     );
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
