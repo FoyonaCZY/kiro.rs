@@ -1,5 +1,7 @@
 import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import { getAccessGroups, setGroupMembers, type AccessGroup } from '@/api/access'
 import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -16,6 +18,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
   useSetPriority,
@@ -60,6 +63,12 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [groupOpen, setGroupOpen] = useState(false)
+  const [groupDraft, setGroupDraft] = useState<string[]>([])
+  const [groupSaving, setGroupSaving] = useState(false)
+  const queryClient = useQueryClient()
+  const accessGroups = useQuery({ queryKey: ['access-groups'], queryFn: getAccessGroups })
+  const joined = (accessGroups.data ?? []).filter((group) => group.members.includes(credential.id))
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -99,6 +108,44 @@ export function CredentialCard({
         },
       }
     )
+  }
+
+  const openGroups = () => {
+    const ids = joined.map((group) => group.id)
+    setGroupDraft(ids.length > 0 ? ids : ['default'])
+    setGroupOpen(true)
+  }
+
+  const saveGroups = async () => {
+    const groups = accessGroups.data ?? []
+    const nextIds = groupDraft.length > 0 ? groupDraft : ['default']
+    const desired = groups.map((group) => {
+      const members = new Set(group.members)
+      if (nextIds.includes(group.id)) members.add(credential.id)
+      else members.delete(credential.id)
+      return { id: group.id, members: [...members] }
+    })
+    const changed = desired.filter((group) => {
+      const previous = groups.find((item) => item.id === group.id)?.members ?? []
+      return previous.length !== group.members.length || previous.some((id) => !group.members.includes(id))
+    })
+    setGroupSaving(true)
+    try {
+      const ordered = [
+        ...changed.filter((group) => nextIds.includes(group.id)),
+        ...changed.filter((group) => !nextIds.includes(group.id)),
+      ]
+      for (const group of ordered) {
+        await setGroupMembers(group.id, group.members)
+      }
+      await queryClient.invalidateQueries({ queryKey: ['access-groups'] })
+      setGroupOpen(false)
+      toast.success('调度分组已更新')
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    } finally {
+      setGroupSaving(false)
+    }
   }
 
   const handleReset = () => {
@@ -180,6 +227,9 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
+                {(joined.length > 0 ? joined : [{ id: 'default', name: '默认' } as AccessGroup]).map((group) => (
+                  <Badge key={group.id} variant="secondary">{group.name}</Badge>
+                ))}
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -303,6 +353,9 @@ export function CredentialCard({
 
           {/* 操作按钮 */}
           <div className="flex flex-wrap gap-2 pt-2 border-t">
+            <Button size="sm" variant="outline" onClick={openGroups}>
+              调度分组
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -379,6 +432,37 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={groupOpen} onOpenChange={setGroupOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>调度分组</DialogTitle>
+            <DialogDescription>
+              {credential.email || `凭据 #${credential.id}`} 可以同时属于多个分组。移出最后一个分组后，会回到默认组。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            {(accessGroups.data ?? []).map((group) => (
+              <label key={group.id} className="flex items-center gap-2 rounded-md border px-3 py-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={groupDraft.includes(group.id)}
+                  onChange={(event) => {
+                    setGroupDraft((current) => event.target.checked
+                      ? [...current, group.id]
+                      : current.filter((id) => id !== group.id))
+                  }}
+                />
+                <span>{group.name}</span>
+              </label>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setGroupOpen(false)} disabled={groupSaving}>取消</Button>
+            <Button onClick={saveGroups} disabled={groupSaving}>保存</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
