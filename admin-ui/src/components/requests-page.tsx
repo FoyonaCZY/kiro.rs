@@ -1,10 +1,13 @@
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
 import { getUsageRequest, getUsageRequests, type UsageRequest, type UsageRequestDetail } from '@/api/usage'
 import { PageHeader } from '@/components/page-header'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { extractErrorMessage } from '@/lib/utils'
+
+type Tab = 'chat' | 'inbound' | 'outbound' | 'diff'
+type StatusFilter = 'all' | 'ok' | 'err'
 
 function money(value: number | null | undefined) {
   if (value == null) return '未定价'
@@ -26,6 +29,12 @@ function pretty(text: string) {
   }
 }
 
+function statusClass(status: number) {
+  if (status >= 500) return 'text-destructive'
+  if (status >= 400) return 'text-amber-700 dark:text-amber-300'
+  return 'text-emerald-700 dark:text-emerald-300'
+}
+
 function textOf(value: unknown): string {
   if (typeof value === 'string') return value
   if (Array.isArray(value)) {
@@ -33,9 +42,9 @@ function textOf(value: unknown): string {
       if (typeof item === 'string') return item
       if (!item || typeof item !== 'object') return String(item ?? '')
       const block = item as { type?: string; text?: string; thinking?: string; name?: string; input?: unknown; content?: unknown }
-      if (block.type === 'thinking' || block.thinking) return `思考\n${block.thinking || block.text || ''}`
+      if (block.type === 'thinking' || block.thinking) return block.thinking || block.text || ''
       if (block.type === 'tool_use') return `工具 ${block.name || ''}\n${pretty(JSON.stringify(block.input ?? ''))}`
-      if (block.type === 'tool_result') return `工具结果\n${textOf(block.content ?? block.text ?? '')}`
+      if (block.type === 'tool_result') return textOf(block.content ?? block.text ?? '')
       if (block.text) return block.text
       return pretty(JSON.stringify(item))
     }).filter(Boolean).join('\n\n')
@@ -45,17 +54,20 @@ function textOf(value: unknown): string {
 }
 
 function conversation(detail: UsageRequestDetail) {
-  const turns: { role: string; label: string; text: string }[] = []
+  const turns: { role: string; label: string; text: string; fold: boolean }[] = []
   let inbound: { system?: unknown; messages?: { role?: string; content?: unknown }[] } | null = null
   try {
     inbound = JSON.parse(detail.inboundBody)
   } catch {
     inbound = null
   }
-  if (inbound?.system) turns.push({ role: 'system', label: '系统', text: textOf(inbound.system) })
+  const push = (role: string, label: string, text: string) => {
+    turns.push({ role, label, text, fold: role === 'system' || text.length > 500 })
+  }
+  if (inbound?.system) push('system', '系统', textOf(inbound.system))
   for (const message of inbound?.messages ?? []) {
     const role = message.role || 'user'
-    turns.push({ role, label: role === 'assistant' ? '助手' : role === 'user' ? '用户' : role, text: textOf(message.content) })
+    push(role, role === 'assistant' ? '助手' : role === 'user' ? '用户' : role, textOf(message.content))
   }
   const response = detail.responseBody?.trim() ?? ''
   if (response) {
@@ -65,31 +77,70 @@ function conversation(detail: UsageRequestDetail) {
     } catch {
       parsed = null
     }
-    turns.push({
-      role: 'assistant',
-      label: '最终响应',
-      text: parsed?.content ? textOf(parsed.content) : response,
-    })
+    const text = parsed?.content ? textOf(parsed.content) : response
+    push('assistant', '最终响应', text)
   }
   return turns
 }
 
+function headerMap(raw: string) {
+  try {
+    const value = JSON.parse(raw) as unknown
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item ?? '')]))
+  } catch {
+    return {}
+  }
+}
+
+function headerDiff(leftRaw: string, rightRaw: string) {
+  const left = headerMap(leftRaw)
+  const right = headerMap(rightRaw)
+  const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()
+  return keys.map((key) => ({
+    key,
+    left: left[key] ?? '',
+    right: right[key] ?? '',
+    changed: (left[key] ?? '') !== (right[key] ?? ''),
+  }))
+}
+
 export function RequestsPage() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [account, setAccount] = useState('all')
+  const [status, setStatus] = useState<StatusFilter>('all')
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['usage-requests'],
     queryFn: getUsageRequests,
   })
+  const accounts = useMemo(() => [...new Set((data ?? []).map((row) => row.account).filter(Boolean) as string[])], [data])
+  const rows = (data ?? []).filter((row) => {
+    if (account !== 'all' && row.account !== account) return false
+    if (status === 'ok' && row.status >= 400) return false
+    if (status === 'err' && row.status < 400) return false
+    return true
+  })
 
   return (
     <div className="space-y-5">
-      <PageHeader title="请求" description="点一行打开详情。对话、入站和出站都在窗口里。">
-        <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>刷新</Button>
+      <PageHeader title="请求" description="最近 200 条。点一行打开详情，对话、原文和请求头对照都在窗口里。">
+        <div className="flex flex-wrap items-center gap-2">
+          <select className="h-9 rounded-md border bg-background px-2 text-sm" value={account} onChange={(event) => setAccount(event.target.value)}>
+            <option value="all">全部账号</option>
+            {accounts.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+          <select className="h-9 rounded-md border bg-background px-2 text-sm" value={status} onChange={(event) => setStatus(event.target.value as StatusFilter)}>
+            <option value="all">全部状态</option>
+            <option value="ok">成功</option>
+            <option value="err">失败</option>
+          </select>
+          <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>刷新</Button>
+        </div>
       </PageHeader>
       {isLoading ? <p className="text-sm text-muted-foreground">加载中</p> : null}
       {error ? <p className="text-sm text-destructive">{extractErrorMessage(error)}</p> : null}
       <div className="overflow-x-auto rounded-md border">
-        <table className="w-full min-w-[920px] text-left text-sm">
+        <table className="w-full min-w-[980px] text-left text-sm">
           <thead className="border-b bg-card text-muted-foreground">
             <tr>
               {['时间', '账号', '模型', '方式', '状态', '耗时', '输入', '输出', '费用', ''].map((label) => (
@@ -98,13 +149,13 @@ export function RequestsPage() {
             </tr>
           </thead>
           <tbody>
-            {(data ?? []).map((row) => (
+            {rows.map((row) => (
               <tr key={row.id} className="cursor-pointer border-b last:border-0 hover:bg-secondary/40" onClick={() => setSelectedId(row.id)}>
                 <td className="whitespace-nowrap px-3 py-2">{new Date(row.time).toLocaleString()}</td>
                 <td className="px-3 py-2">{row.account || '—'}</td>
                 <td className="px-3 py-2">{row.model}</td>
                 <td className="px-3 py-2">{row.stream ? '流式' : '非流式'}</td>
-                <td className="px-3 py-2">{row.status}{row.stopReason ? <span className="ml-2 text-muted-foreground">{row.stopReason}</span> : null}</td>
+                <td className={`px-3 py-2 ${statusClass(row.status)}`}>{row.status}{row.error ? <span className="ml-2 font-normal text-muted-foreground">{row.error}</span> : null}</td>
                 <td className="px-3 py-2">{duration(row.durationMs)}</td>
                 <td className="px-3 py-2">{row.inputTokens}</td>
                 <td className="px-3 py-2">{row.outputTokens}</td>
@@ -114,8 +165,8 @@ export function RequestsPage() {
                 </td>
               </tr>
             ))}
-            {data && data.length === 0 ? (
-              <tr><td className="px-3 py-8 text-muted-foreground" colSpan={10}>还没有请求记录。</td></tr>
+            {data && rows.length === 0 ? (
+              <tr><td className="px-3 py-8 text-muted-foreground" colSpan={10}>没有符合筛选的请求。</td></tr>
             ) : null}
           </tbody>
         </table>
@@ -126,34 +177,48 @@ export function RequestsPage() {
 }
 
 function RequestDialog({ id, row, onClose }: { id: number | null; row?: UsageRequest; onClose: () => void }) {
-  const [tab, setTab] = useState<'chat' | 'inbound' | 'outbound'>('chat')
+  const [tab, setTab] = useState<Tab>('chat')
   const detail = useQuery({
     queryKey: ['usage-request', id],
     queryFn: () => getUsageRequest(id as number),
     enabled: id != null,
   })
   const turns = detail.data ? conversation(detail.data) : []
+  const diff = detail.data ? headerDiff(detail.data.inboundHeaders, detail.data.outboundHeaders) : []
 
   return (
     <Dialog open={id != null} onOpenChange={(open) => { if (!open) { onClose(); setTab('chat') } }}>
-      <DialogContent className="flex max-h-[86vh] w-[min(1100px,calc(100vw-2rem))] max-w-none flex-col gap-4 overflow-hidden">
+      <DialogContent className="flex max-h-[88vh] w-[min(1080px,calc(100vw-2rem))] max-w-none flex-col gap-4 overflow-hidden">
         <DialogHeader>
-          <DialogTitle>请求详情</DialogTitle>
-          {row ? (
-            <p className="text-sm text-muted-foreground">
-              {row.status} · {row.model} · {row.account || '未记录账号'} · {duration(row.durationMs)} · {row.stream ? '流式' : '非流式'}
-            </p>
-          ) : null}
+          <DialogTitle>{row?.model ? `请求详情 · ${row.model}` : '请求详情'}</DialogTitle>
         </DialogHeader>
+        {row ? (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {[
+              ['状态', String(row.status)],
+              ['耗时', duration(row.durationMs)],
+              ['输入', String(row.inputTokens)],
+              ['输出', String(row.outputTokens)],
+              ['费用', money(row.costUsd)],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-md border bg-card px-3 py-2">
+                <div className="text-xs text-muted-foreground">{label}</div>
+                <div className="mt-1 text-sm font-medium">{value}</div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {row?.error ? <p className="text-sm text-destructive">{row.error}</p> : null}
         {detail.isLoading ? <p className="text-sm text-muted-foreground">正在读取</p> : null}
         {detail.error ? <p className="text-sm text-destructive">{extractErrorMessage(detail.error)}</p> : null}
         {detail.data ? (
           <>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {([
                 ['chat', '对话'],
                 ['inbound', '入站'],
                 ['outbound', '出站'],
+                ['diff', '请求头对照'],
               ] as const).map(([key, label]) => (
                 <button key={key} type="button" className={`rounded-md px-3 py-1.5 text-sm ${tab === key ? 'bg-secondary' : 'text-muted-foreground hover:bg-secondary/60'}`} onClick={() => setTab(key)}>
                   {label}
@@ -163,25 +228,48 @@ function RequestDialog({ id, row, onClose }: { id: number | null; row?: UsageReq
             <div className="min-h-0 flex-1 overflow-auto pr-1">
               {tab === 'chat' ? (
                 <div className="space-y-3">
-                  {turns.length === 0 ? <p className="text-sm text-muted-foreground">这条记录解析不出对话。可以看入站原文。</p> : null}
-                  {turns.map((turn, index) => (
-                    <article key={index} className="rounded-md border bg-background p-3">
-                      <div className="mb-1 text-xs text-muted-foreground">{turn.label}</div>
-                      <pre className="whitespace-pre-wrap font-sans text-sm leading-6">{turn.text || '空'}</pre>
-                    </article>
-                  ))}
-                  {!detail.data.responseBody?.trim() ? (
-                    <p className="text-sm text-muted-foreground">这条记录没有保存最终响应。部署这版之后的新请求才会有。</p>
-                  ) : null}
+                  {turns.length === 0 ? <p className="text-sm text-muted-foreground">没有解析出 messages。到「入站」看原文。</p> : null}
+                  {turns.map((turn, index) => <Bubble key={index} label={turn.label} text={turn.text} folded={turn.fold} />)}
+                  {!detail.data.responseBody?.trim() ? <p className="text-sm text-muted-foreground">这条记录没有保存最终响应。这版上线之后的新请求才会有。</p> : null}
                 </div>
               ) : null}
-              {tab === 'inbound' ? <Raw title="入站请求头" text={detail.data.inboundHeaders} bodyTitle="入站请求体" body={detail.data.inboundBody} /> : null}
-              {tab === 'outbound' ? <Raw title="出站请求头" text={detail.data.outboundHeaders} bodyTitle="出站请求体" body={detail.data.outboundBody} /> : null}
+              {tab === 'inbound' ? <Raw title="入站请求头" text={pretty(detail.data.inboundHeaders)} bodyTitle="入站请求体" body={detail.data.inboundBody} /> : null}
+              {tab === 'outbound' ? <Raw title="出站请求头" text={pretty(detail.data.outboundHeaders)} bodyTitle="出站请求体" body={detail.data.outboundBody} /> : null}
+              {tab === 'diff' ? (
+                diff.length === 0 ? <p className="text-sm text-muted-foreground">没有可对照的请求头。</p> : (
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-muted-foreground"><tr><th className="py-2 pr-3">头</th><th className="py-2 pr-3">入站</th><th className="py-2">出站</th></tr></thead>
+                    <tbody>
+                      {diff.map((item) => (
+                        <tr key={item.key} className={`border-t align-top ${item.changed ? 'bg-secondary/50' : ''}`}>
+                          <td className="py-2 pr-3 font-medium">{item.key}</td>
+                          <td className="py-2 pr-3"><pre className="whitespace-pre-wrap">{item.left || '—'}</pre></td>
+                          <td className="py-2"><pre className="whitespace-pre-wrap">{item.right || '—'}</pre></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )
+              ) : null}
             </div>
           </>
         ) : null}
       </DialogContent>
     </Dialog>
+  )
+}
+
+function Bubble({ label, text, folded }: { label: string; text: string; folded: boolean }) {
+  const [open, setOpen] = useState(!folded)
+  const preview = text.split('\n')[0]?.slice(0, 80) || '空'
+  return (
+    <article className="rounded-md border bg-background p-3">
+      <button type="button" className="flex w-full items-center justify-between gap-3 text-left" onClick={() => setOpen((value) => !value)}>
+        <span className="text-xs text-muted-foreground">{label}</span>
+        <span className="truncate text-xs text-muted-foreground">{open ? '收起' : preview}</span>
+      </button>
+      {open ? <pre className="mt-2 whitespace-pre-wrap font-sans text-sm leading-6">{text || '空'}</pre> : null}
+    </article>
   )
 }
 
