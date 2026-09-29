@@ -542,7 +542,9 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>>,
+    answer_text: String,
+    thinking_text: String,
+    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>>,
 }
 
 impl StreamContext {
@@ -569,12 +571,25 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            answer_text: String::new(),
+            thinking_text: String::new(),
             on_usage: None,
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>) {
         self.on_usage = Some(callback);
+    }
+
+    fn assembled_response(&self) -> String {
+        let mut out = String::new();
+        if !self.thinking_text.is_empty() {
+            out.push_str("thinking:\n");
+            out.push_str(&self.thinking_text);
+            out.push_str("\n\n");
+        }
+        out.push_str(&self.answer_text);
+        out
     }
 
     /// 生成 message_start 事件
@@ -855,6 +870,9 @@ impl StreamContext {
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        if !text.is_empty() {
+            self.answer_text.push_str(text);
+        }
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -908,7 +926,10 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.thinking_text.push_str(thinking);
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1088,9 +1109,8 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
-                        );
+                        let pending = self.thinking_buffer.clone();
+                        events.push(self.create_thinking_delta_event(thinking_index, &pending));
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1127,7 +1147,12 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
         let output_tokens = self.output_tokens;
         if let Some(callback) = self.on_usage.clone() {
-            callback(final_input_tokens, output_tokens, self.state_manager.get_stop_reason());
+            callback(
+                final_input_tokens,
+                output_tokens,
+                self.state_manager.get_stop_reason(),
+                self.assembled_response(),
+            );
         }
 
         // 生成最终事件
@@ -1178,7 +1203,7 @@ impl BufferedStreamContext {
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>) {
         self.inner.on_usage = Some(callback);
     }
 

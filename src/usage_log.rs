@@ -103,6 +103,7 @@ pub struct NewRequest {
     pub inbound_body: String,
     pub outbound_headers: String,
     pub outbound_body: String,
+    pub response_body: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +115,7 @@ pub struct RequestDetail {
     pub inbound_body: String,
     pub outbound_headers: String,
     pub outbound_body: String,
+    pub response_body: String,
 }
 
 pub struct UsageLog {
@@ -180,8 +182,8 @@ impl UsageLog {
             }
         };
         let inserted = tx.execute(
-            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 chrono::Utc::now().to_rfc3339(),
                 model,
@@ -199,6 +201,7 @@ impl UsageLog {
                 clip(&request.inbound_body, MAX_BLOB),
                 clip(&request.outbound_headers, MAX_BLOB),
                 clip(&request.outbound_body, MAX_BLOB),
+                clip(&request.response_body, MAX_BLOB),
             ],
         );
         if let Err(err) = inserted {
@@ -283,7 +286,7 @@ impl UsageLog {
         let prices = load_prices(&conn).unwrap_or_default();
         let row = conn
             .query_row(
-                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body
+                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body, response_body
                  FROM requests WHERE id = ?1",
                 params![id as i64],
                 |row| {
@@ -307,6 +310,7 @@ impl UsageLog {
                         inbound_body: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
                         outbound_headers: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
                         outbound_body: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                        response_body: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
                         view: RequestView {
                             cost_usd: charge(
                                 &prices,
@@ -482,6 +486,7 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "requests", "inbound_body", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "outbound_headers", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "requests", "outbound_body", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "response_body", "TEXT NOT NULL DEFAULT ''")?;
     Ok(())
 }
 
@@ -698,6 +703,7 @@ mod tests {
             inbound_body: String::new(),
             outbound_headers: String::new(),
             outbound_body: String::new(),
+            response_body: String::new(),
         }
     }
 
@@ -753,6 +759,7 @@ mod tests {
         request.inbound_body = "{\"messages\":[]}".into();
         request.outbound_headers = "{\"host\":\"q.example\"}".into();
         request.outbound_body = "{\"conversationState\":{}}".into();
+        request.response_body = "{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}".into();
         log.record(request);
         let listed = &log.list(10)[0];
         assert_eq!(listed.record.account, "preview@example.com");
@@ -760,6 +767,7 @@ mod tests {
         let detail = log.get(listed.record.id).unwrap();
         assert!(detail.inbound_body.contains("messages"));
         assert!(detail.outbound_body.contains("conversationState"));
+        assert!(detail.response_body.contains("hello"));
         assert!(!detail.inbound_headers.contains("secret"));
     }
 }

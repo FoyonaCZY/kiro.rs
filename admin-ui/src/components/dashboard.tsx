@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Plus, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -23,6 +23,21 @@ import type { BalanceResponse } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
+}
+
+type AdminPage = 'credentials' | 'access' | 'requests' | 'prices'
+
+function readPage(): AdminPage {
+  const hash = window.location.hash.replace(/^#/, '')
+  if (hash === 'access' || hash === 'requests' || hash === 'prices') return hash
+  return 'credentials'
+}
+
+function openPage(page: AdminPage) {
+  const next = page === 'credentials' ? '#credentials' : `#${page}`
+  if (window.location.hash !== next) {
+    window.location.hash = next
+  }
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -52,7 +67,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
     return false
   })
-  const [page, setPage] = useState<'credentials' | 'access' | 'requests' | 'prices'>('credentials')
+  const [page, setPage] = useState<AdminPage>(readPage)
+
+  useEffect(() => {
+    if (!window.location.hash) {
+      window.location.replace('#credentials')
+    }
+    const sync = () => setPage(readPage())
+    window.addEventListener('hashchange', sync)
+    return () => window.removeEventListener('hashchange', sync)
+  }, [])
 
   const queryClient = useQueryClient()
   const { data, isLoading, error, refetch } = useCredentials()
@@ -112,8 +136,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [data?.credentials])
 
   const toggleDarkMode = () => {
-    setDarkMode(!darkMode)
-    document.documentElement.classList.toggle('dark')
+    const next = !darkMode
+    setDarkMode(next)
+    document.documentElement.classList.toggle('dark', next)
+    localStorage.setItem('kiro-admin-theme', next ? 'dark' : 'light')
   }
 
   const handleViewBalance = (id: number) => {
@@ -559,7 +585,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               key={id}
               type="button"
               className={`block w-full rounded-md px-3 py-2 text-left text-sm ${page === id ? 'bg-secondary' : 'text-muted-foreground hover:bg-secondary/60'}`}
-              onClick={() => setPage(id)}
+              onClick={() => openPage(id)}
             >
               {label}
             </button>
@@ -577,7 +603,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '组内：优先级' : '组内：均衡')}
             </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
@@ -684,41 +710,24 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   验活中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleQueryCurrentPageInfo}
-                  size="sm"
-                  variant="outline"
-                  disabled={queryingInfo}
-                >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
-                </Button>
-              )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleClearAll}
-                  size="sm"
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
-                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
-                >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
-                </Button>
-              )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
-              <Button onClick={() => setSocialLoginOpen(true)} size="sm" variant="outline">
-                代理登录
-              </Button>
+              <details className="relative">
+                <summary className="flex h-8 cursor-pointer list-none items-center rounded-md border px-3 text-sm">更多</summary>
+                <div className="absolute right-0 z-20 mt-1 flex w-56 flex-col gap-1 rounded-md border bg-card p-2 shadow-sm">
+                  {data?.credentials && data.credentials.length > 0 ? (
+                    <Button onClick={handleQueryCurrentPageInfo} size="sm" variant="ghost" disabled={queryingInfo} className="justify-start">
+                      {queryingInfo ? `查询中 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页信息'}
+                    </Button>
+                  ) : null}
+                  {data?.credentials && data.credentials.length > 0 ? (
+                    <Button onClick={handleClearAll} size="sm" variant="ghost" className="justify-start text-destructive" disabled={disabledCredentialCount === 0}>
+                      清除已禁用
+                    </Button>
+                  ) : null}
+                  <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="ghost" className="justify-start">Account Manager 导入</Button>
+                  <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="ghost" className="justify-start">批量导入</Button>
+                  <Button onClick={() => setSocialLoginOpen(true)} size="sm" variant="ghost" className="justify-start">代理登录</Button>
+                </div>
+              </details>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据

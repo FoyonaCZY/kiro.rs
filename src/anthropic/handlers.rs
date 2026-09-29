@@ -56,6 +56,7 @@ fn logged_request(
     stop_reason: String,
     log_ctx: &RequestLogContext,
     target: Option<&crate::kiro::provider::UpstreamTarget>,
+    response_body: &str,
 ) -> crate::usage_log::NewRequest {
     crate::usage_log::NewRequest {
         model: model.to_string(),
@@ -79,6 +80,7 @@ fn logged_request(
             .map(|item| item.outbound_headers.clone())
             .unwrap_or_default(),
         outbound_body: log_ctx.outbound_body.clone(),
+        response_body: response_body.to_string(),
     }
 }
 
@@ -88,11 +90,11 @@ fn attach_usage(
     started: std::time::Instant,
     log_ctx: RequestLogContext,
     target: crate::kiro::provider::UpstreamTarget,
-) -> Option<std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>> {
+) -> Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>> {
     let usage = usage?;
     let model = model.to_string();
     let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Some(std::sync::Arc::new(move |input_tokens, output_tokens, stop_reason| {
+    Some(std::sync::Arc::new(move |input_tokens, output_tokens, stop_reason, response_body| {
         if recorded.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -107,6 +109,7 @@ fn attach_usage(
             stop_reason,
             &log_ctx,
             Some(&target),
+            &response_body,
         ));
     }))
 }
@@ -145,6 +148,7 @@ fn record_usage_error(
         String::new(),
         log_ctx,
         target,
+        "",
     ));
 }
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
@@ -932,6 +936,7 @@ async fn handle_non_stream_request(
             stop_reason.clone(),
             &log_ctx,
             Some(&target),
+            &response_body.to_string(),
         ));
     }
 

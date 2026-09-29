@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { deletePrice, getPrices, getUsageSummary, savePrice, type ModelPrice } from '@/api/usage'
+import { PageHeader } from '@/components/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -68,10 +69,7 @@ export function PricesPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-medium">价格</h1>
-        <p className="text-sm text-muted-foreground">单价是每百万 token 的美元价格。缓存不计入。未匹配到别名的请求费用显示为未定价。</p>
-      </div>
+      <PageHeader title="价格" description="单价是每百万 token 的美元价格。缓存不计入。未匹配到别名的请求费用显示为未定价。" />
 
       <div className="grid gap-4 md:grid-cols-4">
         <Card>

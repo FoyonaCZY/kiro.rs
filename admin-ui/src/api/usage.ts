@@ -36,6 +36,7 @@ export interface UsageRequestDetail extends UsageRequest {
   inboundBody: string
   outboundHeaders: string
   outboundBody: string
+  responseBody?: string
 }
 
 export interface ModelUsage {

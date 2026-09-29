@@ -16,25 +16,44 @@ use tokio::task_local;
 
 use crate::common::auth;
 
+struct RequestScope {
+    group_id: String,
+    allowed: HashSet<u64>,
+}
+
 task_local! {
-    static ALLOWED_CREDENTIALS: HashSet<u64>;
+    static REQUEST_SCOPE: RequestScope;
 }
 
 const DEFAULT_GROUP_ID: &str = "default";
 const DEFAULT_GROUP_NAME: &str = "默认";
 const DEFAULT_KEY_NAME: &str = "默认";
 
+pub fn current_group() -> Option<String> {
+    REQUEST_SCOPE
+        .try_with(|scope| scope.group_id.clone())
+        .ok()
+}
+
 pub fn credential_allowed(id: u64) -> bool {
-    ALLOWED_CREDENTIALS
-        .try_with(|allowed| allowed.contains(&id))
+    REQUEST_SCOPE
+        .try_with(|scope| scope.allowed.contains(&id))
         .unwrap_or(true)
 }
 
-pub async fn run_with_credentials<F>(allowed: HashSet<u64>, future: F) -> F::Output
+pub async fn run_with_credentials<F>(group_id: impl Into<String>, allowed: HashSet<u64>, future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    ALLOWED_CREDENTIALS.scope(allowed, future).await
+    REQUEST_SCOPE
+        .scope(
+            RequestScope {
+                group_id: group_id.into(),
+                allowed,
+            },
+            future,
+        )
+        .await
 }
 
 #[derive(Debug, Clone, Serialize)]

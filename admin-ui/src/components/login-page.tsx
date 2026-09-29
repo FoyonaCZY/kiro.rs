@@ -45,7 +45,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 placeholder="Admin API Key"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                className="text-center"
+                autoFocus
               />
             </div>
             <Button type="submit" className="w-full" disabled={!apiKey.trim()}>

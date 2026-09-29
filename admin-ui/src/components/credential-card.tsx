@@ -145,14 +145,18 @@ export function CredentialCard({
     <>
       <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
+              <CardTitle className="truncate text-base">
                 {credential.email || `凭据 #${credential.id}`}
+              </CardTitle>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1">
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -176,9 +180,9 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
-              </CardTitle>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <span className="text-sm text-muted-foreground">启用</span>
               <Switch
                 checked={!credential.disabled}

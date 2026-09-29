@@ -538,8 +538,10 @@ pub struct MultiTokenManager {
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
-    /// 当前活动凭据 ID
+    /// 当前活动凭据 ID。没有分组范围时使用，管理操作也走这里。
     current_id: Mutex<u64>,
+    /// 每个调度分组自己的粘性凭据。请求选号只读写自己的分组。
+    group_sticky: Mutex<HashMap<String, u64>>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
@@ -673,6 +675,7 @@ impl MultiTokenManager {
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
+            group_sticky: Mutex::new(HashMap::new()),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
@@ -806,11 +809,16 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
+                let scoped_group = crate::access::current_group();
                 let current_hit = if is_balanced {
                     None
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
+                    let current_id = if let Some(group) = &scoped_group {
+                        self.group_sticky.lock().get(group).copied().unwrap_or(0)
+                    } else {
+                        *self.current_id.lock()
+                    };
                     entries
                         .iter()
                         .find(|e| {
@@ -830,17 +838,22 @@ impl MultiTokenManager {
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
                         let mut entries = self.entries.lock();
-                        if !entries.iter().any(|e| e.supports_model(model))
+                        if !entries
+                            .iter()
+                            .any(|e| crate::access::credential_allowed(e.id) && e.supports_model(model))
                             && entries.iter().any(|e| {
-                                e.disabled
+                                crate::access::credential_allowed(e.id)
+                                    && e.disabled
                                     && e.disabled_reason == Some(DisabledReason::TooManyFailures)
                             })
                         {
                             tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                                "当前分组的凭据均已被自动禁用，只重置这一组"
                             );
                             for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                if crate::access::credential_allowed(e.id)
+                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                                {
                                     e.disabled = false;
                                     e.disabled_reason = None;
                                     e.failure_count = 0;
@@ -852,9 +865,11 @@ impl MultiTokenManager {
                     }
 
                     if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
+                        if let Some(group) = &scoped_group {
+                            self.group_sticky.lock().insert(group.clone(), new_id);
+                        } else {
+                            *self.current_id.lock() = new_id;
+                        }
                         (new_id, new_creds)
                     } else {
                         let entries = self.entries.lock();
@@ -2807,5 +2822,99 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    fn api_key_credential(priority: u32, key: &str) -> KiroCredentials {
+        let mut cred = KiroCredentials::default();
+        cred.priority = priority;
+        cred.auth_method = Some("api_key".to_string());
+        cred.kiro_api_key = Some(key.to_string());
+        cred
+    }
+
+    #[test]
+    fn group_pools_stick_separately_and_heal_only_themselves() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let manager = MultiTokenManager::new(
+                Config::default(),
+                vec![
+                    api_key_credential(1, "alpha-key"),
+                    api_key_credential(2, "beta-key"),
+                    api_key_credential(0, "default-key"),
+                ],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            let global_before = manager.snapshot().current_id;
+
+            let alpha = crate::access::run_with_credentials(
+                "alpha",
+                std::collections::HashSet::from([1]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            let beta = crate::access::run_with_credentials(
+                "beta",
+                std::collections::HashSet::from([2]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(alpha.id, 1);
+            assert_eq!(beta.id, 2);
+
+            let alpha_again = crate::access::run_with_credentials(
+                "alpha",
+                std::collections::HashSet::from([1]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            let beta_again = crate::access::run_with_credentials(
+                "beta",
+                std::collections::HashSet::from([2]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(alpha_again.id, 1);
+            assert_eq!(beta_again.id, 2);
+            assert_eq!(manager.snapshot().current_id, global_before);
+
+            let default_group = crate::access::run_with_credentials(
+                "default",
+                std::collections::HashSet::from([3]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(default_group.id, 3);
+
+            assert!(manager.report_failure(1));
+            assert!(manager.report_failure(1));
+            assert!(manager.report_failure(1));
+            assert!(manager.report_failure(2));
+            assert!(manager.report_failure(2));
+            assert!(manager.report_failure(2));
+
+            let healed = crate::access::run_with_credentials(
+                "alpha",
+                std::collections::HashSet::from([1]),
+                manager.acquire_context(None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(healed.id, 1);
+            let snapshot = manager.snapshot();
+            assert!(!snapshot.entries.iter().find(|entry| entry.id == 1).unwrap().disabled);
+            assert!(snapshot.entries.iter().find(|entry| entry.id == 2).unwrap().disabled);
+        });
     }
 }

@@ -1,6 +1,13 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN">
   <head>
+    <script>
+      try {
+        if (localStorage.getItem('kiro-admin-theme') !== 'light') {
+          document.documentElement.classList.add('dark')
+        }
+      } catch (e) {}
+    </script>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />

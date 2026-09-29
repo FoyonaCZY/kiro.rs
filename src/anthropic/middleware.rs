@@ -82,7 +82,8 @@ pub async fn auth_middleware(
             .map(|provider| provider.credential_ids())
             .unwrap_or_default();
         let allowed = access.allowed_credentials(&found.group_id, &ids);
-        return crate::access::run_with_credentials(allowed, next.run(request)).await;
+        return crate::access::run_with_credentials(found.group_id, allowed, next.run(request))
+            .await;
     }
     if auth::constant_time_eq(&presented, &state.api_key) {
         next.run(request).await
