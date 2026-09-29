@@ -542,7 +542,7 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
-    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>>,
+    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>>,
 }
 
 impl StreamContext {
@@ -573,7 +573,7 @@ impl StreamContext {
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>) {
         self.on_usage = Some(callback);
     }
 
@@ -1127,7 +1127,7 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
         let output_tokens = self.output_tokens;
         if let Some(callback) = self.on_usage.clone() {
-            callback(final_input_tokens, output_tokens);
+            callback(final_input_tokens, output_tokens, self.state_manager.get_stop_reason());
         }
 
         // 生成最终事件
@@ -1178,7 +1178,7 @@ impl BufferedStreamContext {
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>) {
         self.inner.on_usage = Some(callback);
     }
 

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 const RETAIN_REQUESTS: i64 = 20_000;
 const PRUNE_EVERY: u64 = 100;
+const MAX_BLOB: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +39,10 @@ pub struct RequestRecord {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub error: Option<String>,
+    pub account: String,
+    pub endpoint: String,
+    pub request_bytes: u64,
+    pub stop_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +95,25 @@ pub struct NewRequest {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub error: Option<String>,
+    pub account: String,
+    pub endpoint: String,
+    pub request_bytes: u64,
+    pub stop_reason: String,
+    pub inbound_headers: String,
+    pub inbound_body: String,
+    pub outbound_headers: String,
+    pub outbound_body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestDetail {
+    #[serde(flatten)]
+    pub view: RequestView,
+    pub inbound_headers: String,
+    pub inbound_body: String,
+    pub outbound_headers: String,
+    pub outbound_body: String,
 }
 
 pub struct UsageLog {
@@ -144,6 +168,9 @@ impl UsageLog {
         let input_tokens = request.input_tokens.max(0);
         let output_tokens = request.output_tokens.max(0);
         let error = request.error.filter(|err| !err.is_empty());
+        let account = clip(&request.account, 200);
+        let endpoint = clip(&request.endpoint, 80);
+        let stop_reason = clip(&request.stop_reason, 80);
         let errors: i64 = if request.status >= 400 { 1 } else { 0 };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -153,8 +180,8 @@ impl UsageLog {
             }
         };
         let inserted = tx.execute(
-            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO requests(time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 chrono::Utc::now().to_rfc3339(),
                 model,
@@ -164,6 +191,14 @@ impl UsageLog {
                 input_tokens,
                 output_tokens,
                 error,
+                account,
+                endpoint,
+                request.request_bytes as i64,
+                stop_reason,
+                clip(&request.inbound_headers, MAX_BLOB),
+                clip(&request.inbound_body, MAX_BLOB),
+                clip(&request.outbound_headers, MAX_BLOB),
+                clip(&request.outbound_body, MAX_BLOB),
             ],
         );
         if let Err(err) = inserted {
@@ -206,7 +241,7 @@ impl UsageLog {
             }
         };
         let mut stmt = match conn.prepare(
-            "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error
+            "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason
              FROM requests ORDER BY id DESC LIMIT ?1",
         ) {
             Ok(stmt) => stmt,
@@ -226,6 +261,10 @@ impl UsageLog {
                 input_tokens: row.get(6)?,
                 output_tokens: row.get(7)?,
                 error: row.get(8)?,
+                account: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                endpoint: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                request_bytes: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+                stop_reason: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
             })
         });
         let Ok(rows) = rows else {
@@ -237,6 +276,52 @@ impl UsageLog {
                 record,
             })
             .collect()
+    }
+
+    pub fn get(&self, id: u64) -> Option<RequestDetail> {
+        let conn = self.conn.lock();
+        let prices = load_prices(&conn).unwrap_or_default();
+        let row = conn
+            .query_row(
+                "SELECT id, time, model, stream, status, duration_ms, input_tokens, output_tokens, error, account, endpoint, request_bytes, stop_reason, inbound_headers, inbound_body, outbound_headers, outbound_body
+                 FROM requests WHERE id = ?1",
+                params![id as i64],
+                |row| {
+                    let record = RequestRecord {
+                        id: row.get::<_, i64>(0)? as u64,
+                        time: row.get(1)?,
+                        model: row.get(2)?,
+                        stream: row.get::<_, i64>(3)? != 0,
+                        status: row.get::<_, i64>(4)? as u16,
+                        duration_ms: row.get::<_, i64>(5)? as u64,
+                        input_tokens: row.get(6)?,
+                        output_tokens: row.get(7)?,
+                        error: row.get(8)?,
+                        account: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                        endpoint: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                        request_bytes: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+                        stop_reason: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    };
+                    Ok(RequestDetail {
+                        inbound_headers: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        inbound_body: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                        outbound_headers: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                        outbound_body: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                        view: RequestView {
+                            cost_usd: charge(
+                                &prices,
+                                &record.model,
+                                record.input_tokens,
+                                record.output_tokens,
+                            ),
+                            record,
+                        },
+                    })
+                },
+            )
+            .optional()
+            .unwrap_or(None);
+        row
     }
 
     pub fn summary(&self) -> UsageSummary {
@@ -388,7 +473,36 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );",
-    )
+    )?;
+    ensure_column(conn, "requests", "account", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "endpoint", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "request_bytes", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "requests", "stop_reason", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "inbound_headers", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "inbound_body", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "outbound_headers", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "requests", "outbound_body", "TEXT NOT NULL DEFAULT ''")?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn prune(conn: &Connection, retain: i64) -> rusqlite::Result<()> {
@@ -497,6 +611,46 @@ pub fn charge(prices: &[ModelPrice], model: &str, input_tokens: i64, output_toke
     Some(input_tokens.max(0) as f64 / million * price.input_per_m + output_tokens.max(0) as f64 / million * price.output_per_m)
 }
 
+pub fn encode_headers<I, K, V>(headers: I) -> String
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers {
+        let name = name.as_ref();
+        let value = if header_sensitive(name) {
+            "[redacted]"
+        } else {
+            value.as_ref()
+        };
+        map.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    }
+    clip(&serde_json::to_string(&map).unwrap_or_default(), MAX_BLOB)
+}
+
+fn header_sensitive(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    ) || name.contains("api-key")
+        || name.contains("secret")
+        || (name.contains("token") && name != "tokentype")
+}
+
+fn clip(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[truncated {} bytes]", &text[..end], text.len() - end)
+}
+
 fn normalize_alias(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
@@ -536,6 +690,14 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 500,
             error: None,
+            account: "preview@example.com".into(),
+            endpoint: "ide".into(),
+            request_bytes: 128,
+            stop_reason: "end_turn".into(),
+            inbound_headers: String::new(),
+            inbound_body: String::new(),
+            outbound_headers: String::new(),
+            outbound_body: String::new(),
         }
     }
 
@@ -571,5 +733,33 @@ mod tests {
         assert_eq!(summary.requests, 3);
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.input_tokens, 3000);
+    }
+
+    #[test]
+    fn detail_keeps_headers_and_redacts_secrets() {
+        let headers = encode_headers([
+            ("user-agent", "cursor"),
+            ("x-api-key", "secret-value"),
+            ("Authorization", "Bearer secret"),
+        ]);
+        assert!(headers.contains("cursor"));
+        assert!(!headers.contains("secret-value"));
+        assert!(!headers.contains("Bearer secret"));
+        assert!(headers.contains("[redacted]"));
+
+        let log = UsageLog::open(None);
+        let mut request = sample("claude-opus-5-5", 200);
+        request.inbound_headers = headers;
+        request.inbound_body = "{\"messages\":[]}".into();
+        request.outbound_headers = "{\"host\":\"q.example\"}".into();
+        request.outbound_body = "{\"conversationState\":{}}".into();
+        log.record(request);
+        let listed = &log.list(10)[0];
+        assert_eq!(listed.record.account, "preview@example.com");
+        assert_eq!(listed.record.request_bytes, 128);
+        let detail = log.get(listed.record.id).unwrap();
+        assert!(detail.inbound_body.contains("messages"));
+        assert!(detail.outbound_body.contains("conversationState"));
+        assert!(!detail.inbound_headers.contains("secret"));
     }
 }

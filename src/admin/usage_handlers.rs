@@ -15,6 +15,16 @@ pub async fn list_requests(State(state): State<AdminState>) -> Json<Vec<RequestV
     Json(state.service.usage.list(200))
 }
 
+pub async fn get_request(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> Response {
+    match state.service.usage.get(id) {
+        Some(detail) => (StatusCode::OK, Json(detail)).into_response(),
+        None => (StatusCode::NOT_FOUND, "请求不存在").into_response(),
+    }
+}
+
 pub async fn usage_summary(State(state): State<AdminState>) -> Json<UsageSummary> {
     Json(state.service.usage.summary())
 }

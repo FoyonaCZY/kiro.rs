@@ -24,27 +24,90 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 
+#[derive(Clone)]
+struct RequestLogContext {
+    inbound_headers: String,
+    inbound_body: String,
+    outbound_body: String,
+}
+
+fn request_log_context(
+    headers: &axum::http::HeaderMap,
+    inbound_body: String,
+    outbound_body: &str,
+) -> RequestLogContext {
+    RequestLogContext {
+        inbound_headers: crate::usage_log::encode_headers(headers.iter().filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| (name.as_str(), value))
+        })),
+        inbound_body,
+        outbound_body: outbound_body.to_string(),
+    }
+}
+
+fn logged_request(
+    model: &str,
+    stream: bool,
+    status: u16,
+    started: std::time::Instant,
+    input_tokens: i64,
+    output_tokens: i64,
+    error: Option<String>,
+    stop_reason: String,
+    log_ctx: &RequestLogContext,
+    target: Option<&crate::kiro::provider::UpstreamTarget>,
+) -> crate::usage_log::NewRequest {
+    crate::usage_log::NewRequest {
+        model: model.to_string(),
+        stream,
+        status,
+        duration_ms: started.elapsed().as_millis() as u64,
+        input_tokens,
+        output_tokens,
+        error,
+        account: target
+            .map(|item| item.account.clone())
+            .unwrap_or_default(),
+        endpoint: target
+            .map(|item| item.endpoint.clone())
+            .unwrap_or_default(),
+        request_bytes: log_ctx.outbound_body.len() as u64,
+        stop_reason,
+        inbound_headers: log_ctx.inbound_headers.clone(),
+        inbound_body: log_ctx.inbound_body.clone(),
+        outbound_headers: target
+            .map(|item| item.outbound_headers.clone())
+            .unwrap_or_default(),
+        outbound_body: log_ctx.outbound_body.clone(),
+    }
+}
+
 fn attach_usage(
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     model: &str,
     started: std::time::Instant,
-) -> Option<std::sync::Arc<dyn Fn(i32, i32) + Send + Sync>> {
+    log_ctx: RequestLogContext,
+    target: crate::kiro::provider::UpstreamTarget,
+) -> Option<std::sync::Arc<dyn Fn(i32, i32, String) + Send + Sync>> {
     let usage = usage?;
     let model = model.to_string();
     let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Some(std::sync::Arc::new(move |input_tokens, output_tokens| {
+    Some(std::sync::Arc::new(move |input_tokens, output_tokens, stop_reason| {
         if recorded.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        usage.record(crate::usage_log::NewRequest {
-            model: model.clone(),
-            stream: true,
-            status: 200,
-            duration_ms: started.elapsed().as_millis() as u64,
-            input_tokens: input_tokens as i64,
-            output_tokens: output_tokens as i64,
-            error: None,
-        });
+        usage.record(logged_request(
+            &model,
+            true,
+            200,
+            started,
+            input_tokens as i64,
+            output_tokens as i64,
+            None,
+            stop_reason,
+            &log_ctx,
+            Some(&target),
+        ));
     }))
 }
 
@@ -55,20 +118,34 @@ fn record_usage_error(
     started: std::time::Instant,
     error: &anyhow::Error,
     input_tokens: i32,
+    log_ctx: &RequestLogContext,
 ) {
     let Some(usage) = usage else {
         return;
     };
     let message: String = error.to_string().chars().take(180).collect();
-    usage.record(crate::usage_log::NewRequest {
-        model: model.to_string(),
+    let status = if message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || message.contains("Input is too long")
+    {
+        400
+    } else {
+        502
+    };
+    let target = error
+        .downcast_ref::<crate::kiro::provider::UpstreamError>()
+        .and_then(|err| err.target.as_ref());
+    usage.record(logged_request(
+        model,
         stream,
-        status: 502,
-        duration_ms: started.elapsed().as_millis() as u64,
-        input_tokens: input_tokens as i64,
-        output_tokens: 0,
-        error: Some(message),
-    });
+        status,
+        started,
+        input_tokens as i64,
+        0,
+        Some(message),
+        String::new(),
+        log_ctx,
+        target,
+    ));
 }
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -349,8 +426,22 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    headers: axum::http::HeaderMap,
+    body: String,
 ) -> Response {
+    let mut payload: MessagesRequest = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体不是合法 JSON: {err}"),
+                )),
+            )
+                .into_response();
+        }
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -452,6 +543,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
         // 流式响应
@@ -463,6 +555,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             state.usage.clone(),
+            log_ctx,
         )
         .await
     } else {
@@ -476,6 +569,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             state.usage.clone(),
+            log_ctx,
         )
         .await
     }
@@ -490,21 +584,23 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    log_ctx: RequestLogContext,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
+    let call = match provider.call_api_stream(request_body).await {
+        Ok(call) => call,
         Err(e) => {
-            record_usage_error(&usage, model, true, started, &e, input_tokens);
+            record_usage_error(&usage, model, true, started, &e, input_tokens, &log_ctx);
             return map_provider_error(e);
         }
     };
+    let response = call.response;
 
     // 创建流处理上下文
     let mut ctx =
         StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
-    if let Some(callback) = attach_usage(usage, model, started) {
+    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target) {
         ctx.set_on_usage(callback);
     }
 
@@ -635,16 +731,19 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    log_ctx: RequestLogContext,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
-        Ok(resp) => resp,
+    let call = match provider.call_api(request_body).await {
+        Ok(call) => call,
         Err(e) => {
-            record_usage_error(&usage, model, false, started, &e, input_tokens);
+            record_usage_error(&usage, model, false, started, &e, input_tokens, &log_ctx);
             return map_provider_error(e);
         }
     };
+    let target = call.target;
+    let response = call.response;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
@@ -657,6 +756,7 @@ async fn handle_non_stream_request(
                 started,
                 &anyhow::Error::msg(e.to_string()),
                 input_tokens,
+                &log_ctx,
             );
             tracing::error!("读取响应体失败: {}", e);
             return (
@@ -821,15 +921,18 @@ async fn handle_non_stream_request(
     });
 
     if let Some(log) = &usage {
-        log.record(crate::usage_log::NewRequest {
-            model: model.to_string(),
-            stream: false,
-            status: 200,
-            duration_ms: started.elapsed().as_millis() as u64,
-            input_tokens: final_input_tokens as i64,
-            output_tokens: output_tokens as i64,
-            error: None,
-        });
+        log.record(logged_request(
+            model,
+            false,
+            200,
+            started,
+            final_input_tokens as i64,
+            output_tokens as i64,
+            None,
+            stop_reason.clone(),
+            &log_ctx,
+            Some(&target),
+        ));
     }
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -906,8 +1009,22 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    headers: axum::http::HeaderMap,
+    body: String,
 ) -> Response {
+    let mut payload: MessagesRequest = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    format!("请求体不是合法 JSON: {err}"),
+                )),
+            )
+                .into_response();
+        }
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -1010,6 +1127,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1021,6 +1139,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             state.usage.clone(),
+            log_ctx,
         )
         .await
     } else {
@@ -1034,6 +1153,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             state.usage.clone(),
+            log_ctx,
         )
         .await
     }
@@ -1051,16 +1171,26 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    log_ctx: RequestLogContext,
 ) -> Response {
     let started = std::time::Instant::now();
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
+    let call = match provider.call_api_stream(request_body).await {
+        Ok(call) => call,
         Err(e) => {
-            record_usage_error(&usage, model, true, started, &e, estimated_input_tokens);
+            record_usage_error(
+                &usage,
+                model,
+                true,
+                started,
+                &e,
+                estimated_input_tokens,
+                &log_ctx,
+            );
             return map_provider_error(e);
         }
     };
+    let response = call.response;
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
@@ -1069,7 +1199,7 @@ async fn handle_stream_request_buffered(
         thinking_enabled,
         tool_name_map,
     );
-    if let Some(callback) = attach_usage(usage, model, started) {
+    if let Some(callback) = attach_usage(usage, model, started, log_ctx, call.target) {
         ctx.set_on_usage(callback);
     }
 

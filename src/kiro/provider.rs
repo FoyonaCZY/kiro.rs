@@ -29,6 +29,48 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+/// 一次上游调用选中的凭据。请求头里的访问令牌已经打码。
+#[derive(Debug, Clone)]
+pub struct UpstreamTarget {
+    pub account: String,
+    pub endpoint: String,
+    pub outbound_headers: String,
+}
+
+pub struct UpstreamResponse {
+    pub response: reqwest::Response,
+    pub target: UpstreamTarget,
+}
+
+/// 上游失败。Display 只保留原始错误文本，方便按上游错误码识别。
+#[derive(Debug)]
+pub struct UpstreamError {
+    pub message: String,
+    pub target: Option<UpstreamTarget>,
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpstreamError {}
+
+fn tag_upstream(err: anyhow::Error, target: Option<UpstreamTarget>) -> anyhow::Error {
+    if target.is_none()
+        || err.downcast_ref::<CredentialsCoolingDown>().is_some()
+        || err.downcast_ref::<UpstreamError>().is_some()
+    {
+        return err;
+    }
+    UpstreamError {
+        message: err.to_string(),
+        target,
+    }
+    .into()
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -98,6 +140,38 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
+    fn target_for(
+        &self,
+        id: u64,
+        credentials: &KiroCredentials,
+        endpoint: &Arc<dyn KiroEndpoint>,
+        machine_id: &str,
+    ) -> UpstreamTarget {
+        let name = credentials
+            .endpoint
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(self.default_endpoint.as_str());
+        let account = credentials
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("#{id}"));
+        let rctx = RequestContext {
+            credentials,
+            token: "",
+            machine_id,
+            config: self.token_manager.config(),
+        };
+        UpstreamTarget {
+            account,
+            endpoint: name.to_string(),
+            outbound_headers: crate::usage_log::encode_headers(endpoint.api_log_headers(&rctx)),
+        }
+    }
+
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
@@ -112,12 +186,12 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
         self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
         self.call_api_with_retry(request_body, true).await
     }
 
@@ -297,10 +371,11 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<UpstreamResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_target: Option<UpstreamTarget> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
@@ -337,6 +412,8 @@ impl KiroProvider {
 
             let url = endpoint.api_url(&rctx);
             let body = endpoint.transform_api_body(request_body, &rctx);
+            let target = self.target_for(ctx.id, &ctx.credentials, &endpoint, &machine_id);
+            last_target = Some(target.clone());
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -371,7 +448,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(UpstreamResponse { response, target });
             }
 
             // 失败响应：读取 body 用于日志/错误信息
@@ -419,7 +496,10 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(tag_upstream(
+                    anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body),
+                    Some(target.clone()),
+                ));
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -490,7 +570,10 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                return Err(tag_upstream(
+                    anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body),
+                    Some(target.clone()),
+                ));
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -513,13 +596,14 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
+        Err(match last_error {
+            Some(err) => tag_upstream(err, last_target),
+            None => anyhow::anyhow!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
                 api_type,
                 max_retries
-            )
-        }))
+            ),
+        })
     }
 
     /// 从请求体中提取模型信息

@@ -92,8 +92,8 @@ async fn rate_limit_failover_covers_api_stream_and_mcp() {
             let provider =
                 KiroProvider::with_proxy(manager.clone(), None, endpoints, "test".into());
             let result = match kind {
-                "api" => provider.call_api("{}").await,
-                "stream" => provider.call_api_stream("{}").await,
+                "api" => provider.call_api("{}").await.map(|call| call.response),
+                "stream" => provider.call_api_stream("{}").await.map(|call| call.response),
                 _ => provider.call_mcp("{}").await,
             };
             assert_eq!(

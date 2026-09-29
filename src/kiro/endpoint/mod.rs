@@ -54,6 +54,11 @@ pub trait KiroEndpoint: Send + Sync {
     fn is_bearer_token_invalid(&self, body: &str) -> bool {
         default_is_bearer_token_invalid(body)
     }
+
+    /// 出站请求头的可记录副本。不要包含访问令牌。
+    fn api_log_headers(&self, _ctx: &RequestContext<'_>) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// 装饰请求时可用的上下文

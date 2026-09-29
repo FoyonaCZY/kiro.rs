@@ -25,6 +25,17 @@ export interface UsageRequest {
   outputTokens: number
   error?: string | null
   costUsd?: number | null
+  account?: string
+  endpoint?: string
+  requestBytes?: number
+  stopReason?: string
+}
+
+export interface UsageRequestDetail extends UsageRequest {
+  inboundHeaders: string
+  inboundBody: string
+  outboundHeaders: string
+  outboundBody: string
 }
 
 export interface ModelUsage {
@@ -56,6 +67,11 @@ export interface ModelPrice {
 
 export async function getUsageRequests(): Promise<UsageRequest[]> {
   const { data } = await api.get<UsageRequest[]>('/usage/requests')
+  return data
+}
+
+export async function getUsageRequest(id: number): Promise<UsageRequestDetail> {
+  const { data } = await api.get<UsageRequestDetail>(`/usage/requests/${id}`)
   return data
 }
 

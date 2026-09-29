@@ -72,6 +72,28 @@ impl KiroEndpoint for IdeEndpoint {
         req
     }
 
+    fn api_log_headers(&self, ctx: &RequestContext<'_>) -> Vec<(String, String)> {
+        let user_agent = self.user_agent(ctx);
+        let mut headers = vec![
+            ("content-type".into(), "application/json".into()),
+            ("Connection".into(), "close".into()),
+            ("x-amzn-codewhisperer-optout".into(), "true".into()),
+            (
+                "x-amzn-kiro-agent-mode".into(),
+                ctx.config.agent_mode.clone(),
+            ),
+            ("x-amz-user-agent".into(), user_agent.clone()),
+            ("user-agent".into(), user_agent),
+            ("host".into(), self.host(ctx)),
+            ("amz-sdk-request".into(), "attempt=1; max=3".into()),
+            ("Authorization".into(), "Bearer [redacted]".into()),
+        ];
+        if let Some(token_type) = ctx.credentials.upstream_token_type() {
+            headers.push(("TokenType".into(), token_type.to_string()));
+        }
+        headers
+    }
+
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let user_agent = self.user_agent(ctx);
         let mut req = req
