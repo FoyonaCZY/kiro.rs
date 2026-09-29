@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct CredentialsStatusResponse {
     /// 凭据总数
     pub total: usize,
-    /// 可用凭据数量（未禁用）
+    /// 可用凭据数量（未禁用且不在冷却中）
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
@@ -22,6 +22,8 @@ pub struct CredentialsStatusResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialStatusItem {
+    /// 限流冷却剩余秒数，0 表示未冷却。
+    pub cooldown_remaining_seconds: u64,
     /// 凭据唯一 ID
     pub id: u64,
     /// 优先级（数字越小优先级越高）

@@ -500,6 +500,9 @@ pub async fn handle_websearch_request(
     let search_results = match call_mcp_api(&provider, &mcp_request).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
+            if e.is::<crate::kiro::token_manager::CredentialsCoolingDown>() {
+                return super::handlers::map_provider_error(e);
+            }
             tracing::warn!("MCP API 调用失败: {}", e);
             None
         }

@@ -15,9 +15,13 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialsCoolingDown, MultiTokenManager};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+
+#[cfg(test)]
+#[path = "provider_tests.rs"]
+mod tests;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -66,8 +70,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -94,10 +98,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -137,8 +138,7 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -191,6 +191,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let cooldown = Self::rate_limit_delay(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -200,6 +201,17 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+
+            if status.as_u16() == 429 {
+                self.token_manager.report_rate_limited(ctx.id, cooldown);
+                last_error = Some(
+                    CredentialsCoolingDown {
+                        retry_after: cooldown,
+                    }
+                    .into(),
+                );
+                continue;
+            }
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -222,7 +234,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -238,7 +255,7 @@ impl KiroProvider {
             }
 
             // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -295,8 +312,7 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    return Err(e);
                 }
             };
 
@@ -350,6 +366,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let cooldown = Self::rate_limit_delay(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -359,6 +376,17 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            if status.as_u16() == 429 {
+                self.token_manager.report_rate_limited(ctx.id, cooldown);
+                last_error = Some(
+                    CredentialsCoolingDown {
+                        retry_after: cooldown,
+                    }
+                    .into(),
+                );
+                continue;
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -408,7 +436,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -434,9 +467,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 408/5xx 重试但不禁用凭据；429 已由临时冷却处理。
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -515,5 +547,33 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Duration {
+        let kiro_delay = headers
+            .get("x-amzn-kiro-ratelimit-retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_millis);
+        let standard_delay = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| {
+                v.trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(Duration::from_secs)
+                    .or_else(|| {
+                        chrono::DateTime::parse_from_rfc2822(v).ok().map(|date| {
+                            (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                                .to_std()
+                                .unwrap_or_default()
+                        })
+                    })
+            });
+        kiro_delay
+            .or(standard_delay)
+            .unwrap_or(Duration::from_secs(60))
+            .clamp(Duration::from_secs(1), Duration::from_secs(86_400))
     }
 }

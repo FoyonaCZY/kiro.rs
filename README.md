@@ -177,7 +177,7 @@ docker-compose up
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
+| `kiroVersion` | string | `1.1.70` | Kiro IDE 版本号（用于请求中的客户端标识） |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
@@ -202,7 +202,7 @@ docker-compose up
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
-   "kiroVersion": "0.9.2",
+   "kiroVersion": "1.1.70",
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
    "nodeVersion": "22.21.1",
@@ -317,7 +317,7 @@ docker-compose up
 
 支持全局代理和凭据级代理，凭据级代理会覆盖该凭据产生的所有出站连接（API 请求、Token 刷新、额度查询）。
 
-**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理
+**代理优先级**：`凭据.proxyUrl` > `config.proxyUrl` > 无代理。出站连接不自动继承系统或环境变量代理；如需代理，请显式配置 `proxyUrl`。`direct` 同时绕过全局代理和系统代理。
 
 | 凭据 `proxyUrl` 值 | 行为 |
 |---|---|
@@ -435,19 +435,27 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 ## 模型映射
 
+按模型家族和完整版本号解析，同时接受横杠和点号版本；可带日期及 `-thinking` 后缀。符合格式的新版本保留原版本转发，由 Kiro 上游决定是否支持，不自动降级为旧模型或其他模型家族。
+
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
-| `*sonnet-5*` | `claude-sonnet-5` |
-| `*sonnet*`（含 4.6/4-6） | `claude-sonnet-4.6` |
-| `*sonnet*`（含 4.5/4-5） | `claude-sonnet-4.5` |
-| `*opus-5*` | `claude-opus-5` |
-| `*opus*`（含 4.8/4-8） | `claude-opus-4.8` |
-| `*opus*`（含 4.7/4-7） | `claude-opus-4.7` |
-| `*opus*`（含 4.6/4-6） | `claude-opus-4.6` |
-| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
-| `*haiku*` | `claude-haiku-4.5` |
+| `claude-opus-5-5` / `claude-opus-5.5` | `claude-opus-5.5` |
+| `claude-sonnet-5-5` / `claude-sonnet-5.5` | `claude-sonnet-5.5` |
+| `claude-opus-5` | `claude-opus-5` |
+| `claude-sonnet-5` | `claude-sonnet-5` |
+| `claude-opus-4-8` / `claude-opus-4.8` | `claude-opus-4.8` |
+| `claude-sonnet-4-6` / `claude-sonnet-4.6` | `claude-sonnet-4.6` |
+| `claude-haiku-4-5` / `claude-haiku-4.5` | `claude-haiku-4.5` |
+
+`/v1/models` 是本地兼容模型清单，不代表当前账号拥有对应模型权限。5.5 的模型名转换和上下文窗口已适配，实际调用仍需上游开通权限；未对所有新模型的 thinking / tool use 行为做线上验证。未明确识别的新版本使用保守的 200K 上下文估算。
 
 Sonnet 5 的 thinking 行为与已知限制见 [docs/claude-sonnet-5.md](docs/claude-sonnet-5.md)。
+
+## 限流冷却
+
+上游 API 或 MCP 返回 429 时，凭据进入临时冷却并尝试其他符合模型要求的账号；不会增加认证失败次数或持久化为禁用状态。优先使用 `x-amzn-kiro-ratelimit-retry-after`（毫秒），其次使用 `Retry-After`（秒数或 HTTP 日期），缺失或无效时默认 60 秒，范围限制为 1 秒至 24 小时。
+
+当所有符合条件的账号都在冷却中，服务立即返回 HTTP 429、`rate_limit_error` 和 `Retry-After`，由客户端等待后重试。冷却自动到期，重启会清除内存中的冷却状态。管理台显示剩余冷却秒数，Admin API 的 `cooldownRemainingSeconds` 为 0 时表示不在冷却中，`available` 不计入冷却账号。普通网络错误和 5xx 保持原有退避重试策略。
 
 ## Admin（可选）
 

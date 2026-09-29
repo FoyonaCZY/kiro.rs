@@ -49,7 +49,11 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // 代理只由显式配置决定；否则 direct 会被 HTTP_PROXY / 系统代理覆盖。
+    let mut builder = Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(timeout_secs));
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -85,6 +89,55 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 在子进程注入系统代理，避免并行测试修改全局环境变量。
+    #[test]
+    fn explicit_direct_ignores_environment_proxy() {
+        if std::env::var_os("KIRO_TEST_DIRECT_CHILD").is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let app = axum::Router::new().route("/", axum::routing::get(|| async { "direct" }));
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let credentials = crate::kiro::model::credentials::KiroCredentials {
+                    proxy_url: Some("direct".into()),
+                    ..Default::default()
+                };
+                let global_proxy = ProxyConfig::new("http://127.0.0.1:1");
+                let effective = credentials.effective_proxy(Some(&global_proxy));
+                let client = build_client(effective.as_ref(), 5, TlsBackend::Rustls).unwrap();
+                assert_eq!(
+                    client.get(url).send().await.unwrap().text().await.unwrap(),
+                    "direct"
+                );
+                server.abort();
+            });
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "http_client::tests::explicit_direct_ignores_environment_proxy",
+                "--nocapture",
+            ])
+            .env("KIRO_TEST_DIRECT_CHILD", "1");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            child.env(key, "http://127.0.0.1:1");
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            child.env(key, "");
+        }
+        assert!(child.status().unwrap().success());
+    }
 
     #[test]
     fn test_proxy_config_new() {

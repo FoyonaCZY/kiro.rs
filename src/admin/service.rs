@@ -68,6 +68,7 @@ impl AdminService {
             .entries
             .into_iter()
             .map(|entry| CredentialStatusItem {
+                cooldown_remaining_seconds: entry.cooldown_remaining_seconds,
                 id: entry.id,
                 priority: entry.priority,
                 disabled: entry.disabled,
@@ -448,7 +449,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

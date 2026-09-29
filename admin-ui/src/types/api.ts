@@ -8,6 +8,7 @@ export interface CredentialsStatusResponse {
 
 // 单个凭据状态
 export interface CredentialStatusItem {
+  cooldownRemainingSeconds?: number
   id: number
   priority: number
   disabled: boolean

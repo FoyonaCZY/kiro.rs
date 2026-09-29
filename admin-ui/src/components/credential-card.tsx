@@ -159,6 +159,9 @@ export function CredentialCard({
                 {credential.disabled && (
                   <Badge variant="destructive">已禁用</Badge>
                 )}
+                {!credential.disabled && (credential.cooldownRemainingSeconds ?? 0) > 0 && (
+                  <Badge variant="outline">限流冷却 {credential.cooldownRemainingSeconds} 秒</Badge>
+                )}
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
