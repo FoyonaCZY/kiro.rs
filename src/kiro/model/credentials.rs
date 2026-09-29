@@ -64,8 +64,8 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
-    /// 凭据级 Machine ID 配置（可选）
-    /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
+    /// 凭据级 Machine ID（可选，64 位十六进制或 UUID）
+    /// 未配置时由管理器生成随机值并写回；不从 refreshToken 或 API Key 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 
@@ -271,6 +271,21 @@ impl KiroCredentials {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
+    }
+
+    /// 上游 Q API 的 `TokenType`。Social 不发送。
+    ///
+    /// 对齐 Kiro IDE 1.1.70：`api_key` → `API_KEY`，`idc` → `SSO_OIDC`，
+    /// `external_idp` → `EXTERNAL_IDP`。
+    pub fn upstream_token_type(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            return Some("API_KEY");
+        }
+        match self.auth_method.as_deref() {
+            Some(method) if method.eq_ignore_ascii_case("idc") => Some("SSO_OIDC"),
+            Some(method) if method.eq_ignore_ascii_case("external_idp") => Some("EXTERNAL_IDP"),
+            _ => None,
+        }
     }
 }
 

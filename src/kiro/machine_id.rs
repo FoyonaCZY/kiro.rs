@@ -42,47 +42,61 @@ fn normalize_machine_id(machine_id: &str) -> Option<String> {
     None
 }
 
-/// 根据凭证信息生成唯一的 Machine ID
+/// 根据凭证信息得到 Machine ID。
 ///
 /// 优先级：
-/// 1. 凭据级 `machineId`（若配置且格式合法）
-/// 2. 全局 `config.machineId`（若配置且格式合法）
-/// 3. 根据凭据类型派生（互斥，由 [`KiroCredentials::is_api_key_credential`] 分流）：
-///    - API Key 凭据：基于 `kiroApiKey` 派生
-///    - OAuth 凭据：基于 `refreshToken` 派生
-/// 4. 兜底：基于随机种子派生，按 `credentials.id` 在进程内缓存（首次触发 warn 日志）
+/// 1. 凭据级 `machineId`（合法时规范化为 64 位十六进制）
+/// 2. 全局 `config.machineId`
+/// 3. 进程内兜底
+///
+/// 不从 refreshToken 或 API Key 派生：那些值会轮换，也不该出现在 User-Agent 的来源里。
+/// 多账号部署由 [`ensure_persistent_machine_id`] 在加载时生成随机 ID 并写回凭据。
 pub fn generate_from_credentials(credentials: &KiroCredentials, config: &Config) -> String {
-    // 如果配置了凭据级 machineId，优先使用
     if let Some(ref machine_id) = credentials.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
     }
 
-    // 如果配置了全局 machineId，作为默认值
     if let Some(ref machine_id) = config.machine_id {
         if let Some(normalized) = normalize_machine_id(machine_id) {
             return normalized;
         }
     }
 
-    // 按凭据类型派生（API Key 与 refreshToken 两条路径互斥，不回落）
-    if credentials.is_api_key_credential() {
-        // API Key 凭据：基于 kiroApiKey 派生
-        if let Some(ref api_key) = credentials.kiro_api_key {
-            if !api_key.is_empty() {
-                return sha256_hex(&format!("KiroAPIKey/{}", api_key));
-            }
+    fallback_machine_id(credentials)
+}
+
+/// 生成一个新的 64 位十六进制 machineId。每次调用都不同。
+pub fn random_machine_id() -> String {
+    sha256_hex(&format!("KiroInstall/{}", Uuid::new_v4()))
+}
+
+/// 保证凭据带有可写回文件的 machineId。
+///
+/// 已有合法值时只做规范化；缺失或格式无效时生成新的随机值。
+/// 返回 `true` 表示调用方需要持久化。
+pub fn ensure_persistent_machine_id(credentials: &mut KiroCredentials) -> bool {
+    if let Some(normalized) = credentials
+        .machine_id
+        .as_deref()
+        .and_then(normalize_machine_id)
+    {
+        if credentials.machine_id.as_deref() != Some(normalized.as_str()) {
+            credentials.machine_id = Some(normalized);
+            return true;
         }
-    } else if let Some(ref refresh_token) = credentials.refresh_token {
-        // OAuth 凭据：基于 refreshToken 派生
-        if !refresh_token.is_empty() {
-            return sha256_hex(&format!("KotlinNativeAPI/{}", refresh_token));
-        }
+        return false;
     }
 
-    // 兜底：走派生流程生成随机 machineId，按凭据 id 进程内稳定
-    fallback_machine_id(credentials)
+    if credentials.machine_id.is_some() {
+        tracing::warn!(
+            credential_id = ?credentials.id,
+            "凭据 machineId 不是 64 位十六进制或 UUID，已重新生成"
+        );
+    }
+    credentials.machine_id = Some(random_machine_id());
+    true
 }
 
 /// 为缺失派生材料的凭据生成兜底 machineId
@@ -181,20 +195,20 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result.len(), 64);
-        // 应与 KiroAPIKey/<api_key> 的哈希一致
-        assert_eq!(result, sha256_hex("KiroAPIKey/ksk_test_api_key"));
+        assert_ne!(result, sha256_hex("KiroAPIKey/ksk_test_api_key"));
     }
 
     #[test]
     fn test_api_key_and_refresh_token_are_mutually_exclusive() {
-        // 同时存在 kiroApiKey 和 refreshToken 时，应走 API Key 分支
+        // 两种密钥都存在时，也不从其中任何一种派生 machineId
         let mut credentials = KiroCredentials::default();
         credentials.kiro_api_key = Some("ksk_test".to_string());
         credentials.refresh_token = Some("should_not_be_used".to_string());
         let config = Config::default();
 
         let result = generate_from_credentials(&credentials, &config);
-        assert_eq!(result, sha256_hex("KiroAPIKey/ksk_test"));
+        assert_eq!(result.len(), 64);
+        assert_ne!(result, sha256_hex("KiroAPIKey/ksk_test"));
     }
 
     #[test]
@@ -278,5 +292,31 @@ mod tests {
 
         let result = generate_from_credentials(&credentials, &config);
         assert_eq!(result.len(), 64);
+    }
+
+    #[test]
+    fn test_ensure_persistent_machine_id_is_stable_and_unique() {
+        let mut first = KiroCredentials::default();
+        let mut second = KiroCredentials::default();
+        assert!(ensure_persistent_machine_id(&mut first));
+        assert!(ensure_persistent_machine_id(&mut second));
+        let first_id = first.machine_id.clone().unwrap();
+        let second_id = second.machine_id.clone().unwrap();
+        assert_eq!(first_id.len(), 64);
+        assert_ne!(first_id, second_id);
+        assert!(!ensure_persistent_machine_id(&mut first));
+        assert_eq!(first.machine_id.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[test]
+    fn test_ensure_normalizes_uuid_without_regenerating() {
+        let mut credentials = KiroCredentials::default();
+        credentials.machine_id = Some("2582956e-cc88-4669-b546-07adbffcb894".to_string());
+        assert!(ensure_persistent_machine_id(&mut credentials));
+        assert_eq!(
+            credentials.machine_id.as_deref(),
+            Some("2582956ecc884669b54607adbffcb8942582956ecc884669b54607adbffcb894")
+        );
+        assert!(!ensure_persistent_machine_id(&mut credentials));
     }
 }

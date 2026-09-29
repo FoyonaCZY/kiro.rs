@@ -49,11 +49,16 @@ pub struct Config {
     #[serde(default)]
     pub api_key: Option<String>,
 
+    /// UA 的 `os/` 段，格式 `平台#版本`，不含 CPU 架构。默认固定，避免每次启动改口。
     #[serde(default = "default_system_version")]
     pub system_version: String,
 
     #[serde(default = "default_node_version")]
     pub node_version: String,
+
+    /// `generateAssistantResponse` 的 `x-amzn-kiro-agent-mode`。
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
 
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
@@ -131,12 +136,15 @@ fn default_kiro_version() -> String {
 }
 
 fn default_system_version() -> String {
-    const SYSTEM_VERSIONS: &[&str] = &["darwin#24.6.0", "win32#10.0.22631"];
-    SYSTEM_VERSIONS[fastrand::usize(..SYSTEM_VERSIONS.len())].to_string()
+    "win32#10.0.26200".to_string()
+}
+
+fn default_agent_mode() -> String {
+    "vibe".to_string()
 }
 
 fn default_node_version() -> String {
-    "22.22.0".to_string()
+    "24.15.0".to_string()
 }
 
 fn default_count_tokens_auth_type() -> String {
@@ -172,6 +180,7 @@ impl Default for Config {
             api_key: None,
             system_version: default_system_version(),
             node_version: default_node_version(),
+            agent_mode: default_agent_mode(),
             tls_backend: default_tls_backend(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
@@ -236,7 +245,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

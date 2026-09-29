@@ -153,7 +153,7 @@ async fn refresh_social_token(
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
+    let social_user_agent = crate::kiro::identity::social_refresh_user_agent(config, &machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
@@ -164,10 +164,7 @@ async fn refresh_social_token(
         .post(&refresh_url)
         .header("Accept", "application/json, text/plain, */*")
         .header("Content-Type", "application/json")
-        .header(
-            "User-Agent",
-            format!("KiroIDE-{}-{}", kiro_version, machine_id),
-        )
+        .header("User-Agent", social_user_agent)
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
         .header("Connection", "close")
@@ -242,14 +239,8 @@ async fn refresh_idc_token(
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
-
-    let x_amz_user_agent = "aws-sdk-js/3.980.0 KiroIDE";
-    let user_agent = format!(
-        "aws-sdk-js/3.980.0 ua/2.1 os/{} lang/js md/nodejs#{} api/sso-oidc#3.980.0 m/E KiroIDE",
-        os_name, node_version
-    );
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let user_agent = crate::kiro::identity::sdk_user_agent(config, &machine_id, "sso-oidc");
 
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
@@ -262,7 +253,7 @@ async fn refresh_idc_token(
     let response = client
         .post(&refresh_url)
         .header("content-type", "application/json")
-        .header("x-amz-user-agent", x_amz_user_agent)
+        .header("x-amz-user-agent", &user_agent)
         .header("user-agent", &user_agent)
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
@@ -332,9 +323,8 @@ pub(crate) async fn get_usage_limits(
     let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = &config.kiro_version;
-    let os_name = &config.system_version;
-    let node_version = &config.node_version;
+    let user_agent =
+        crate::kiro::identity::sdk_user_agent(config, &machine_id, "codewhispererruntime");
 
     // 构建 URL
     let mut url = format!(
@@ -347,18 +337,11 @@ pub(crate) async fn get_usage_limits(
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
 
-    // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
-
     let client = build_client(proxy, 60, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
-        .header("x-amz-user-agent", &amz_user_agent)
+        .header("x-amz-user-agent", &user_agent)
         .header("user-agent", &user_agent)
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
@@ -366,8 +349,8 @@ pub(crate) async fn get_usage_limits(
         .header("Authorization", format!("Bearer {}", token))
         .header("Connection", "close");
 
-    if credentials.is_api_key_credential() {
-        request = request.header("tokentype", "API_KEY");
+    if let Some(token_type) = credentials.upstream_token_type() {
+        request = request.header("TokenType", token_type);
     }
 
     let response = request.send().await?;
@@ -611,7 +594,6 @@ impl MultiTokenManager {
         let mut next_id = max_existing_id + 1;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
-        let config_ref = &config;
 
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
@@ -624,9 +606,7 @@ impl MultiTokenManager {
                     has_new_ids = true;
                     id
                 });
-                if cred.machine_id.is_none() {
-                    cred.machine_id =
-                        Some(machine_id::generate_from_credentials(&cred, config_ref));
+                if machine_id::ensure_persistent_machine_id(&mut cred) {
                     has_new_machine_ids = true;
                 }
                 CredentialEntry {
@@ -1813,6 +1793,7 @@ impl MultiTokenManager {
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
+        machine_id::ensure_persistent_machine_id(&mut validated_cred);
         validated_cred.email = new_cred.email;
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
