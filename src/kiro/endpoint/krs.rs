@@ -14,9 +14,6 @@ use super::{KiroEndpoint, RequestContext};
 /// KRS 端点名称。
 pub const KRS_ENDPOINT_NAME: &str = "krs";
 
-/// 已用真实凭据打通过的 KRS 客户端版本。不要换成 Q 端点那条 SDK User-Agent。
-const KRS_IDE_VERSION: &str = "1.0.437";
-
 const KRS_HOST: &str = "runtime.us-east-1.kiro.dev";
 
 /// Kiro Runtime Service 端点。
@@ -28,14 +25,14 @@ impl KrsEndpoint {
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
-        format!("KiroIDE {KRS_IDE_VERSION} {}", ctx.machine_id)
+        format!("KiroIDE {} {}", ctx.config.kiro_version, ctx.machine_id)
     }
 
     fn amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/{} KiroIDE-{}-{}",
             crate::kiro::identity::SDK_VERSION,
-            KRS_IDE_VERSION,
+            ctx.config.kiro_version,
             ctx.machine_id
         )
     }
@@ -189,7 +186,7 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "user-agent")
             .map(|(_, value)| value.as_str());
-        assert_eq!(user_agent, Some("KiroIDE 1.0.437 abc123"));
+        assert_eq!(user_agent, Some("KiroIDE 1.1.70 abc123"));
         assert!(
             headers
                 .iter()
