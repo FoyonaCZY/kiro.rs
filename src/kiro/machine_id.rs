@@ -21,7 +21,7 @@ static FALLBACK_MACHINE_IDS: OnceLock<Mutex<HashMap<Option<u64>, String>>> = Onc
 /// 支持以下格式：
 /// - 64 字符十六进制字符串（直接返回）
 /// - UUID 格式（如 "2582956e-cc88-4669-b546-07adbffcb894"，移除连字符后补齐到 64 字符）
-fn normalize_machine_id(machine_id: &str) -> Option<String> {
+pub(crate) fn normalize_machine_id(machine_id: &str) -> Option<String> {
     let trimmed = machine_id.trim();
 
     // 如果已经是 64 字符，直接返回

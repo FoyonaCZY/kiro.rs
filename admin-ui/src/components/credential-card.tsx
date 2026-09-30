@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { getAccessGroups, setGroupMembers, type AccessGroup } from '@/api/access'
 import { formatCNY, formatCostRatio, getAccountCosts, setAccountCost } from '@/api/usage'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Pencil } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +19,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem } from '@/types/api'
+import { EditCredentialDialog } from '@/components/edit-credential-dialog'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
@@ -47,6 +48,7 @@ export function CredentialCard({
   const [costValue, setCostValue] = useState('')
   const [costSaving, setCostSaving] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [editOpen, setEditOpen] = useState(false)
   const [groupOpen, setGroupOpen] = useState(false)
   const [groupDraft, setGroupDraft] = useState<string[]>([])
   const [groupSaving, setGroupSaving] = useState(false)
@@ -431,6 +433,14 @@ export function CredentialCard({
             </Button>
             <Button
               size="sm"
+              variant="outline"
+              onClick={() => setEditOpen(true)}
+            >
+              <Pencil className="h-4 w-4 mr-1" />
+              编辑
+            </Button>
+            <Button
+              size="sm"
               variant="destructive"
               onClick={() => setShowDeleteDialog(true)}
               disabled={!credential.disabled}
@@ -442,6 +452,12 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      <EditCredentialDialog
+        credential={credential}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+      />
 
       <Dialog open={groupOpen} onOpenChange={setGroupOpen}>
         <DialogContent>

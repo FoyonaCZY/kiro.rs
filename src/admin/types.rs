@@ -64,6 +64,24 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据上显式写的端点。空表示用默认端点。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    pub has_proxy_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    pub has_client_secret: bool,
+    pub has_refresh_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -143,6 +161,28 @@ pub struct AddCredentialRequest {
 
 fn default_auth_method() -> String {
     "social".to_string()
+}
+
+/// 修改已有凭据。缺省字段表示不改。
+/// 名称、区域、端点、代理地址传空字符串表示清空；密码、Refresh Token、Client Secret 传空表示保留。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialRequest {
+    pub email: Option<String>,
+    pub priority: Option<u32>,
+    /// 整段粘贴，例如 socks5://host:port:user:pass。有值时覆盖下面三个代理字段。
+    pub proxy: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub machine_id: Option<String>,
 }
 
 /// 添加凭据成功响应

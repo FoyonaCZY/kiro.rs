@@ -14,13 +14,13 @@ use super::{
         add_credential, complete_social_login, delete_credential, force_refresh_token,
         get_all_credentials, get_credential_balance, get_load_balancing_mode, reset_failure_count,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode,
-        start_social_login,
+        start_social_login, update_credential,
     },
+    middleware::{AdminState, admin_auth_middleware},
     usage_handlers::{
         account_costs, delete_price, get_request, list_prices, list_requests, set_account_cost,
         upsert_price, usage_summary,
     },
-    middleware::{AdminState, admin_auth_middleware},
 };
 
 /// 创建 Admin API 路由
@@ -47,7 +47,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
-        .route("/credentials/{id}", delete(delete_credential))
+        .route(
+            "/credentials/{id}",
+            put(update_credential).delete(delete_credential),
+        )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
@@ -69,7 +72,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/access/keys", get(list_keys).post(create_key))
         .route("/access/keys/{id}", put(update_key).delete(delete_key))
         .route("/access/groups", get(list_groups).post(create_group))
-        .route("/access/groups/{id}", put(rename_group).delete(delete_group))
+        .route(
+            "/access/groups/{id}",
+            put(rename_group).delete(delete_group),
+        )
         .route("/access/groups/{id}/members", put(set_members))
         .layer(middleware::from_fn_with_state(
             state.clone(),

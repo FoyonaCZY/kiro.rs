@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint, KrsEndpoint, effective_endpoint_name};
-use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
+use kiro::model::credentials::KiroCredentials;
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
@@ -42,20 +42,16 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
+    // 凭据以同目录的 accounts.sqlite 为准。库是空的才从 credentials.json 导入一次。
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
-        std::process::exit(1);
-    });
-
-    // 判断是否为多凭据格式（用于刷新后回写）
-    let is_multiple_format = credentials_config.is_multiple();
-
-    // 转换为按优先级排序的凭据列表
-    let mut credentials_list = credentials_config.into_sorted_credentials();
+    let (mut credentials_list, is_multiple_format) =
+        kiro::token_manager::load_startup_credentials(std::path::Path::new(&credentials_path))
+            .unwrap_or_else(|e| {
+                tracing::error!("加载凭证失败: {}", e);
+                std::process::exit(1);
+            });
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {

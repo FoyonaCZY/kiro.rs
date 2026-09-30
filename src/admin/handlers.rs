@@ -11,6 +11,7 @@ use super::{
     types::{
         AddCredentialRequest, CompleteSocialLoginRequest, SetDisabledRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateCredentialRequest,
     },
 };
 
@@ -50,6 +51,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/credentials/:id
+/// 修改凭据的名称、代理、端点、区域等。空密码表示不改。
+pub async fn update_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialRequest>,
+) -> impl IntoResponse {
+    match state.service.update_credential(id, payload) {
+        Ok(()) => Json(SuccessResponse::new(format!("凭据 #{id} 已更新"))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -289,6 +289,116 @@ impl KiroCredentials {
     }
 }
 
+/// 管理端填写的代理。`url` 为 None 表示回退全局代理，`direct` 表示直连。
+/// 用户名和密码单独存放，不放进 URL。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedProxy {
+    pub url: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// 解析管理端的代理输入。
+///
+/// 支持：空（回退全局）、`direct`（直连）、`socks5://host:port`、
+/// `socks5://user:pass@host:port`、`socks5://host:port:user:pass`、
+/// 以及不带协议的 `host:port:user:pass`（按 socks5）。
+/// 协议只接受 socks5、socks5h、http、https。
+pub fn parse_proxy_line(raw: &str) -> anyhow::Result<ParsedProxy> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return Ok(ParsedProxy {
+            url: None,
+            username: None,
+            password: None,
+        });
+    }
+    if raw.eq_ignore_ascii_case("direct") {
+        return Ok(ParsedProxy {
+            url: Some("direct".into()),
+            username: None,
+            password: None,
+        });
+    }
+
+    if let Some((scheme, body)) = raw.split_once("://") {
+        let scheme = scheme.to_ascii_lowercase();
+        check_proxy_scheme(&scheme)?;
+        if body.contains('@') {
+            let (userinfo, hostport) = body.rsplit_once('@').unwrap();
+            let hostport = normalize_hostport(hostport)?;
+            let (username, password) = split_userinfo(userinfo);
+            return Ok(ParsedProxy {
+                url: Some(format!("{scheme}://{hostport}")),
+                username,
+                password,
+            });
+        }
+        return parse_hostport_parts(&scheme, body);
+    }
+
+    parse_hostport_parts("socks5", raw)
+}
+
+fn check_proxy_scheme(scheme: &str) -> anyhow::Result<()> {
+    match scheme {
+        "socks5" | "socks5h" | "http" | "https" => Ok(()),
+        _ => anyhow::bail!("代理协议只支持 socks5、socks5h、http、https"),
+    }
+}
+
+fn parse_hostport_parts(scheme: &str, body: &str) -> anyhow::Result<ParsedProxy> {
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() == 2 {
+        let hostport = normalize_hostport(body)?;
+        return Ok(ParsedProxy {
+            url: Some(format!("{scheme}://{hostport}")),
+            username: None,
+            password: None,
+        });
+    }
+    if parts.len() >= 4 {
+        let hostport = normalize_hostport(&format!("{}:{}", parts[0], parts[1]))?;
+        let username = parts[2].trim();
+        let password = parts[3..].join(":");
+        if username.is_empty() || password.is_empty() {
+            anyhow::bail!("代理账号或密码为空");
+        }
+        return Ok(ParsedProxy {
+            url: Some(format!("{scheme}://{hostport}")),
+            username: Some(username.to_string()),
+            password: Some(password),
+        });
+    }
+    anyhow::bail!(
+        "代理地址无效。可用 socks5://user:pass@host:port，或 socks5://host:port:user:pass"
+    )
+}
+
+fn normalize_hostport(hostport: &str) -> anyhow::Result<String> {
+    let (host, port) = hostport
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("代理缺少端口"))?;
+    if host.is_empty() || host.contains('/') || host.contains(' ') || host.contains('@') {
+        anyhow::bail!("代理主机无效");
+    }
+    let port_num: u16 = port.parse().map_err(|_| anyhow::anyhow!("代理端口无效"))?;
+    if port_num == 0 {
+        anyhow::bail!("代理端口无效");
+    }
+    Ok(format!("{host}:{port_num}"))
+}
+
+fn split_userinfo(userinfo: &str) -> (Option<String>, Option<String>) {
+    let (user, pass) = match userinfo.split_once(':') {
+        Some((user, pass)) => (user, Some(pass)),
+        None => (userinfo, None),
+    };
+    let username = (!user.is_empty()).then(|| user.to_string());
+    let password = pass.and_then(|pass| (!pass.is_empty()).then(|| pass.to_string()));
+    (username, password)
+}
+
 #[cfg(test)]
 impl KiroCredentials {
     fn from_json(json_string: &str) -> Result<Self, serde_json::Error> {
@@ -884,5 +994,36 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_proxy_line_formats() {
+        let cleared = parse_proxy_line("  ").unwrap();
+        assert_eq!(cleared.url, None);
+        assert_eq!(
+            parse_proxy_line("direct").unwrap().url.as_deref(),
+            Some("direct")
+        );
+
+        let plain = parse_proxy_line("socks5://gate.example:1000").unwrap();
+        assert_eq!(plain.url.as_deref(), Some("socks5://gate.example:1000"));
+        assert_eq!(plain.username, None);
+        assert_eq!(plain.password, None);
+
+        let at = parse_proxy_line("socks5://user:p%3Aass@gate.example:1000").unwrap();
+        assert_eq!(at.url.as_deref(), Some("socks5://gate.example:1000"));
+        assert_eq!(at.username.as_deref(), Some("user"));
+        assert_eq!(at.password.as_deref(), Some("p%3Aass"));
+
+        let pasted = parse_proxy_line("socks5://gate.example:1000:user-a:secret:part").unwrap();
+        assert_eq!(pasted.url.as_deref(), Some("socks5://gate.example:1000"));
+        assert_eq!(pasted.username.as_deref(), Some("user-a"));
+        assert_eq!(pasted.password.as_deref(), Some("secret:part"));
+
+        let bare = parse_proxy_line("gate.example:1000:user-a:secret").unwrap();
+        assert_eq!(bare.url.as_deref(), Some("socks5://gate.example:1000"));
+
+        assert!(parse_proxy_line("ftp://gate.example:1000").is_err());
+        assert!(parse_proxy_line("socks5://gate.example:0").is_err());
     }
 }

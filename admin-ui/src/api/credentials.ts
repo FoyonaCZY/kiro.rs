@@ -114,6 +114,14 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
   return data
 }
 
+export async function updateCredential(
+  id: number,
+  req: import('@/types/api').UpdateCredentialRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(`/credentials/${id}`, req)
+  return data
+}
+
 // 获取负载均衡模式
 export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.get<{ mode: 'priority' | 'balanced' }>('/config/load-balancing')

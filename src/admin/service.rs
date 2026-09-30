@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialUpdate, MultiTokenManager};
 use crate::usage_log::UsageLog;
 
 use super::social_login::{SocialLoginStore, exchange_social_code, parse_callback};
@@ -18,6 +18,7 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    UpdateCredentialRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -166,6 +167,16 @@ impl AdminService {
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
+                    proxy_username: entry.proxy_username,
+                    has_proxy_password: entry.has_proxy_password,
+                    region: entry.region,
+                    auth_region: entry.auth_region,
+                    api_region: entry.api_region,
+                    client_id: entry.client_id,
+                    has_client_secret: entry.has_client_secret,
+                    has_refresh_token: entry.has_refresh_token,
+                    machine_id: entry.machine_id,
+                    configured_endpoint: entry.endpoint.clone(),
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     endpoint,
@@ -206,6 +217,52 @@ impl AdminService {
         self.token_manager
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 修改凭据资料。校验失败返回 400，改代理后下一次请求生效。
+    pub fn update_credential(
+        &self,
+        id: u64,
+        req: UpdateCredentialRequest,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(name) = req
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !self.known_endpoints.contains(name) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{name}\""
+                )));
+            }
+        }
+        let update = CredentialUpdate {
+            email: req.email,
+            priority: req.priority,
+            proxy_line: req.proxy,
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
+            endpoint: req.endpoint,
+            region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            refresh_token: req.refresh_token,
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            machine_id: req.machine_id,
+        };
+        self.token_manager
+            .update_credential(id, update)
+            .map_err(|err| {
+                let msg = err.to_string();
+                if msg.contains("不存在") {
+                    AdminServiceError::NotFound { id }
+                } else {
+                    AdminServiceError::InvalidCredential(msg)
+                }
+            })
     }
 
     /// 重置失败计数并重新启用

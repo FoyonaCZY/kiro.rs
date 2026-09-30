@@ -12,13 +12,14 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::credential_store::CredentialStore;
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials, parse_proxy_line};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -513,6 +514,22 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 代理用户名。密码不放进快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    pub has_proxy_password: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    pub has_client_secret: bool,
+    pub has_refresh_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -527,6 +544,203 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+}
+
+/// 管理端提交的凭据修改。`None` 表示这项不改。
+/// 名称、区域、端点、代理地址传空字符串表示清空；密码、Refresh Token、Client Secret 传空表示保留。
+#[derive(Debug, Default)]
+pub struct CredentialUpdate {
+    pub email: Option<String>,
+    pub priority: Option<u32>,
+    /// 整段粘贴，覆盖代理地址、用户名和密码。
+    pub proxy_line: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    /// 空字符串表示保留原密码。
+    pub proxy_password: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub refresh_token: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub machine_id: Option<String>,
+}
+
+/// 启动时加载凭据。数据库里已有数据就以数据库为准，不再读 JSON。
+pub fn load_startup_credentials(path: &Path) -> anyhow::Result<(Vec<KiroCredentials>, bool)> {
+    let store = open_credential_store(Some(path))?.expect("凭据路径不为空");
+    if store.is_empty() {
+        let config = CredentialsConfig::load(path)?;
+        let multiple = config.is_multiple();
+        tracing::info!("凭据数据库为空，准备从 {:?} 导入", path);
+        Ok((config.into_sorted_credentials(), multiple))
+    } else {
+        let loaded = store.load()?;
+        tracing::info!(
+            "已从数据库加载 {} 个凭据，{:?} 保留作备份",
+            loaded.len(),
+            path
+        );
+        Ok((loaded, true))
+    }
+}
+
+fn open_credential_store(path: Option<&Path>) -> anyhow::Result<Option<CredentialStore>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(Some(CredentialStore::open_in(dir)?))
+}
+
+fn display_proxy_url(url: Option<&str>) -> Option<String> {
+    let url = url?;
+    if let Some((scheme, rest)) = url.split_once("://") {
+        if let Some((_, host)) = rest.rsplit_once('@') {
+            return Some(format!("{scheme}://{host}"));
+        }
+    }
+    Some(url.to_string())
+}
+
+fn blank_to_none(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn apply_credential_update(
+    cred: &mut KiroCredentials,
+    update: &CredentialUpdate,
+) -> anyhow::Result<()> {
+    if let Some(email) = &update.email {
+        cred.email = blank_to_none(email);
+    }
+    if let Some(priority) = update.priority {
+        cred.priority = priority;
+    }
+    apply_proxy_update(cred, update)?;
+    if let Some(endpoint) = &update.endpoint {
+        cred.endpoint = blank_to_none(endpoint);
+    }
+    if let Some(region) = &update.region {
+        cred.region = blank_to_none(region);
+    }
+    if let Some(region) = &update.auth_region {
+        cred.auth_region = blank_to_none(region);
+    }
+    if let Some(region) = &update.api_region {
+        cred.api_region = blank_to_none(region);
+    }
+    if let Some(client_id) = &update.client_id {
+        cred.client_id = blank_to_none(client_id);
+    }
+    if let Some(secret) = update
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        cred.client_secret = Some(secret.to_string());
+    }
+    if let Some(machine) = update
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        cred.machine_id = Some(
+            machine_id::normalize_machine_id(machine)
+                .ok_or_else(|| anyhow::anyhow!("Machine ID 需要是 64 位十六进制或 UUID"))?,
+        );
+    }
+    if let Some(token) = update
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if cred.is_api_key_credential() {
+            anyhow::bail!("API Key 凭据没有 Refresh Token");
+        }
+        cred.refresh_token = Some(token.to_string());
+        cred.access_token = None;
+        cred.expires_at = None;
+    }
+    Ok(())
+}
+
+fn apply_proxy_update(cred: &mut KiroCredentials, update: &CredentialUpdate) -> anyhow::Result<()> {
+    if let Some(line) = update.proxy_line.as_deref() {
+        let parsed = parse_proxy_line(line)?;
+        let keep_password = parsed.password.is_none()
+            && parsed
+                .url
+                .as_deref()
+                .is_some_and(|url| !url.eq_ignore_ascii_case("direct"));
+        let old_password = cred.proxy_password.clone();
+        cred.proxy_url = parsed.url;
+        cred.proxy_username = parsed.username;
+        cred.proxy_password = if keep_password {
+            old_password
+        } else {
+            parsed.password
+        };
+        return Ok(());
+    }
+
+    let password = update
+        .proxy_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let touches =
+        update.proxy_url.is_some() || update.proxy_username.is_some() || password.is_some();
+    if !touches {
+        return Ok(());
+    }
+
+    if let Some(url) = &update.proxy_url {
+        let parsed = parse_proxy_line(url)?;
+        let explicit_direct = parsed
+            .url
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("direct"));
+        if parsed.url.is_none() || explicit_direct {
+            cred.proxy_url = parsed.url;
+            cred.proxy_username = None;
+            cred.proxy_password = None;
+            return Ok(());
+        }
+        if parsed.username.is_some() || parsed.password.is_some() {
+            let keep_password = parsed.password.is_none();
+            let old_password = cred.proxy_password.clone();
+            cred.proxy_url = parsed.url;
+            cred.proxy_username = parsed.username;
+            cred.proxy_password = if keep_password {
+                old_password
+            } else {
+                parsed.password
+            };
+            return Ok(());
+        }
+        cred.proxy_url = parsed.url;
+    }
+    if let Some(username) = &update.proxy_username {
+        cred.proxy_username = blank_to_none(username);
+    }
+    if let Some(password) = password {
+        cred.proxy_password = Some(password.to_string());
+    }
+    Ok(())
 }
 
 /// 多凭据 Token 管理器
@@ -546,7 +760,10 @@ pub struct MultiTokenManager {
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
+    /// 凭据数据库。有凭据路径时打开同目录的 accounts.sqlite。
+    store: Option<CredentialStore>,
     /// 是否为多凭据格式（数组写成数组，单对象写成对象）
+    #[allow(dead_code)]
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
@@ -670,6 +887,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let store = open_credential_store(credentials_path.as_deref())?;
         let manager = Self {
             config,
             proxy,
@@ -678,18 +896,25 @@ impl MultiTokenManager {
             group_sticky: Mutex::new(HashMap::new()),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
+            store,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
 
-        // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
-        if has_new_ids || has_new_machine_ids {
+        // 库是空的就导入这次加载的凭据。之后刷新 token、改代理都写库，不再改 JSON。
+        let should_import = manager.store.as_ref().is_some_and(|store| store.is_empty());
+        if should_import || has_new_ids || has_new_machine_ids {
             if let Err(e) = manager.persist_credentials() {
-                tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
-            } else {
-                tracing::info!("已补全凭据 ID/machineId 并写回配置文件");
+                tracing::warn!("写入凭据数据库失败: {}", e);
+            } else if should_import {
+                tracing::info!(
+                    "凭据数据库为空，已导入 {} 条，之后以数据库为准，credentials.json 不再改写",
+                    manager.total_count()
+                );
+            } else if manager.store.is_some() {
+                tracing::info!("已补全凭据 ID/machineId 并写入数据库");
             }
         }
 
@@ -838,18 +1063,14 @@ impl MultiTokenManager {
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
                         let mut entries = self.entries.lock();
-                        if !entries
-                            .iter()
-                            .any(|e| crate::access::credential_allowed(e.id) && e.supports_model(model))
-                            && entries.iter().any(|e| {
-                                crate::access::credential_allowed(e.id)
-                                    && e.disabled
-                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                            })
-                        {
-                            tracing::warn!(
-                                "当前分组的凭据均已被自动禁用，只重置这一组"
-                            );
+                        if !entries.iter().any(|e| {
+                            crate::access::credential_allowed(e.id) && e.supports_model(model)
+                        }) && entries.iter().any(|e| {
+                            crate::access::credential_allowed(e.id)
+                                && e.disabled
+                                && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                        }) {
+                            tracing::warn!("当前分组的凭据均已被自动禁用，只重置这一组");
                             for e in entries.iter_mut() {
                                 if crate::access::credential_allowed(e.id)
                                     && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -876,7 +1097,9 @@ impl MultiTokenManager {
                         let now = Instant::now();
                         if let Some(retry_after) = entries
                             .iter()
-                            .filter(|e| e.supports_model(model) && crate::access::credential_allowed(e.id))
+                            .filter(|e| {
+                                e.supports_model(model) && crate::access::credential_allowed(e.id)
+                            })
                             .filter_map(|e| e.cooldown_until)
                             .filter_map(|until| until.checked_duration_since(now))
                             .min()
@@ -1051,11 +1274,8 @@ impl MultiTokenManager {
     /// - `Ok(false)` - 跳过写入（无路径，或单对象文件在内存中已有多条凭据）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
+        let Some(store) = &self.store else {
+            return Ok(false);
         };
 
         // 收集所有凭据
@@ -1073,28 +1293,13 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 单对象文件保持对象；内存里被追加过凭据时不改写，避免覆盖成数组。
-        let json = if self.is_multiple_format {
-            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
-        } else if let [cred] = credentials.as_slice() {
-            serde_json::to_string_pretty(cred).context("序列化凭据失败")?
-        } else {
-            tracing::warn!(
-                "单对象凭据文件在内存中有 {} 条凭据，跳过回写以避免改变文件格式",
-                credentials.len()
-            );
-            return Ok(false);
-        };
-
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        let save = || store.save(&credentials);
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            tokio::task::block_in_place(save)?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            save()?;
         }
-
-        tracing::debug!("已回写凭据到文件: {:?}", path);
+        tracing::debug!("已把 {} 条凭据写入数据库", credentials.len());
         Ok(true)
     }
 
@@ -1528,7 +1733,16 @@ impl MultiTokenManager {
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
+                    proxy_url: display_proxy_url(e.credentials.proxy_url.as_deref()),
+                    proxy_username: e.credentials.proxy_username.clone(),
+                    has_proxy_password: e.credentials.proxy_password.is_some(),
+                    region: e.credentials.region.clone(),
+                    auth_region: e.credentials.auth_region.clone(),
+                    api_region: e.credentials.api_region.clone(),
+                    client_id: e.credentials.client_id.clone(),
+                    has_client_secret: e.credentials.client_secret.is_some(),
+                    has_refresh_token: e.credentials.refresh_token.is_some(),
+                    machine_id: e.credentials.machine_id.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| {
                         match r {
@@ -1610,6 +1824,22 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
         }
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 修改凭据的名称、优先级、代理、端点和区域。立刻写库，下一次请求就用新代理。
+    ///
+    /// 代理密码和 Refresh Token、Client Secret 传空表示不改。
+    pub fn update_credential(&self, id: u64, update: CredentialUpdate) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            apply_credential_update(&mut entry.credentials, &update)?;
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -2470,9 +2700,13 @@ mod tests {
     }
 
     #[test]
-    fn test_single_credential_file_persists_as_object() {
-        let path =
-            std::env::temp_dir().join(format!("kiro-single-cred-{}.json", uuid::Uuid::new_v4()));
+    fn test_credential_updates_go_to_sqlite_and_leave_json_untouched() {
+        let dir = std::env::temp_dir().join(format!("kiro-cred-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials.json");
+        let original = "{\"authMethod\":\"social\"}\n";
+        std::fs::write(&path, original).unwrap();
+
         let mut cred = KiroCredentials::default();
         cred.auth_method = Some("social".to_string());
         cred.refresh_token = Some("r".repeat(120));
@@ -2485,17 +2719,54 @@ mod tests {
         )
         .unwrap();
 
-        {
-            let mut entries = manager.entries.lock();
-            entries[0].credentials.access_token = Some("updated-access-token".to_string());
-        }
-        assert!(manager.persist_credentials().unwrap());
+        let mut update = CredentialUpdate::default();
+        update.email = Some("a@example.com".into());
+        update.priority = Some(3);
+        update.proxy_line = Some("socks5://gate.example:1000:user-a:secret-a".into());
+        manager.update_credential(1, update).unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.trim_start().starts_with('{'), "单对象文件不应写成数组");
-        let parsed: KiroCredentials = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed.access_token.as_deref(), Some("updated-access-token"));
-        std::fs::remove_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let store = CredentialStore::open_in(&dir).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].email.as_deref(), Some("a@example.com"));
+        assert_eq!(loaded[0].priority, 3);
+        assert_eq!(
+            loaded[0].proxy_url.as_deref(),
+            Some("socks5://gate.example:1000")
+        );
+        assert_eq!(loaded[0].proxy_username.as_deref(), Some("user-a"));
+        assert_eq!(loaded[0].proxy_password.as_deref(), Some("secret-a"));
+
+        let mut keep = CredentialUpdate::default();
+        keep.proxy_url = Some("socks5://gate.example:2000".into());
+        keep.proxy_username = Some("user-b".into());
+        manager.update_credential(1, keep).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded[0].proxy_url.as_deref(),
+            Some("socks5://gate.example:2000")
+        );
+        assert_eq!(loaded[0].proxy_username.as_deref(), Some("user-b"));
+        assert_eq!(loaded[0].proxy_password.as_deref(), Some("secret-a"));
+        let snap = manager.snapshot();
+        assert_eq!(
+            snap.entries[0].proxy_url.as_deref(),
+            Some("socks5://gate.example:2000")
+        );
+        assert!(snap.entries[0].has_proxy_password);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        std::fs::write(
+            &path,
+            "{\"authMethod\":\"social\",\"email\":\"json-only@example.com\"}\n",
+        )
+        .unwrap();
+        let (reloaded, _) = load_startup_credentials(&path).unwrap();
+        assert_eq!(reloaded[0].email.as_deref(), Some("a@example.com"));
+        assert_ne!(reloaded[0].email.as_deref(), Some("json-only@example.com"));
+        drop(store);
+        drop(manager);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2913,8 +3184,22 @@ mod tests {
             .unwrap();
             assert_eq!(healed.id, 1);
             let snapshot = manager.snapshot();
-            assert!(!snapshot.entries.iter().find(|entry| entry.id == 1).unwrap().disabled);
-            assert!(snapshot.entries.iter().find(|entry| entry.id == 2).unwrap().disabled);
+            assert!(
+                !snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == 1)
+                    .unwrap()
+                    .disabled
+            );
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == 2)
+                    .unwrap()
+                    .disabled
+            );
         });
     }
 }
