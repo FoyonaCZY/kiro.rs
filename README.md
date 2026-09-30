@@ -1,5 +1,10 @@
 # kiro-rs
 
+> [!WARNING]
+> **本仓库已废弃，不再更新。** 后续开发在 [FoyonaCZY/kiro2api](https://github.com/FoyonaCZY/kiro2api)（Go 重写）。
+> `config.json`、`credentials.json` 和 `accounts.sqlite` / `usage.sqlite` / `access.sqlite` 格式不变，kiro2api 可以直接接管同一个数据目录。
+> 最后一个版本是 `09108f4`；Deploy 工作流暂时保留，用于回滚。
+
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
 ---
