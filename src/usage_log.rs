@@ -126,7 +126,11 @@ pub struct RequestRecord {
 }
 
 impl RequestRecord {
+    /// 计费用的 token。失败请求（含断流）不计费，一律按 0。
     fn tokens(&self) -> Tokens {
+        if self.status >= 400 {
+            return Tokens::default();
+        }
         Tokens {
             input: self.input_tokens,
             output: self.output_tokens,
@@ -259,6 +263,9 @@ impl UsageLog {
                 tracing::warn!("导入旧的 usage.json 失败: {}", err);
             }
         }
+        if let Err(err) = exclude_failed_tokens_from_totals(&conn) {
+            tracing::warn!("扣回失败请求 token 失败: {}", err);
+        }
         let _ = prune(&conn, retain_requests);
         Arc::new(Self {
             conn: Mutex::new(conn),
@@ -342,11 +349,12 @@ impl UsageLog {
             params![
                 total_key,
                 errors,
-                input_tokens,
-                output_tokens,
-                cache_read,
-                cache_write_5m,
-                cache_write_1h
+                // 失败请求只计次数，token 不进汇总，也就不计费
+                if errors == 0 { input_tokens } else { 0 },
+                if errors == 0 { output_tokens } else { 0 },
+                if errors == 0 { cache_read } else { 0 },
+                if errors == 0 { cache_write_5m } else { 0 },
+                if errors == 0 { cache_write_1h } else { 0 }
             ],
         ) {
             tracing::warn!("累计用量失败: {}", err);
@@ -882,6 +890,72 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         ensure_column(conn, "prices", column, "REAL")?;
     }
     ensure_column(conn, "requests", "credential_id", "INTEGER")?;
+    Ok(())
+}
+
+/// 早期版本把失败请求的 token 也累加进了 model_totals，汇总里会被计费。
+/// 用明细里的失败行一次性扣回。只执行一次，靠 meta 标记。
+/// 明细超过保留上限被清理的失败行扣不回来，这部分会继续留在汇总里。
+fn exclude_failed_tokens_from_totals(conn: &Connection) -> rusqlite::Result<()> {
+    const KEY: &str = "failed_tokens_excluded";
+    let done: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", params![KEY], |row| row.get(0))
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let mut failed: HashMap<String, Tokens> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens
+             FROM requests WHERE status >= 400",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Tokens {
+                    input: row.get(1)?,
+                    output: row.get(2)?,
+                    cache_read: row.get(3)?,
+                    cache_write_5m: row.get(4)?,
+                    cache_write_1h: row.get(5)?,
+                },
+            ))
+        })?;
+        for (model, tokens) in rows.flatten() {
+            let sum = failed.entry(normalize_alias(&model)).or_default();
+            sum.input += tokens.input.max(0);
+            sum.output += tokens.output.max(0);
+            sum.cache_read += tokens.cache_read.max(0);
+            sum.cache_write_5m += tokens.cache_write_5m.max(0);
+            sum.cache_write_1h += tokens.cache_write_1h.max(0);
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    for (model, tokens) in &failed {
+        tx.execute(
+            "UPDATE model_totals SET
+               input_tokens = max(input_tokens - ?2, 0),
+               output_tokens = max(output_tokens - ?3, 0),
+               cache_read_tokens = max(cache_read_tokens - ?4, 0),
+               cache_write_5m_tokens = max(cache_write_5m_tokens - ?5, 0),
+               cache_write_1h_tokens = max(cache_write_1h_tokens - ?6, 0)
+             WHERE model = ?1",
+            params![
+                model,
+                tokens.input,
+                tokens.output,
+                tokens.cache_read,
+                tokens.cache_write_5m,
+                tokens.cache_write_1h
+            ],
+        )?;
+    }
+    tx.execute("INSERT INTO meta(key, value) VALUES(?1, '1')", params![KEY])?;
+    tx.commit()?;
+    if !failed.is_empty() {
+        tracing::info!(models = failed.len(), "已从模型汇总扣回失败请求的 token");
+    }
     Ok(())
 }
 
@@ -1604,7 +1678,53 @@ mod tests {
         let summary = log.summary();
         assert_eq!(summary.requests, 3);
         assert_eq!(summary.errors, 1);
-        assert_eq!(summary.input_tokens, 3000);
+        // 失败的那条只计次数，token 不进汇总
+        assert_eq!(summary.input_tokens, 2000);
+    }
+
+    #[test]
+    fn failed_requests_are_never_billed() {
+        let log = UsageLog::open(None);
+        log.upsert_price(price()).unwrap();
+        log.record(sample("claude-opus-5-5", 200));
+        let mut broken = sample("claude-opus-5-5", 502);
+        broken.error = Some("上游流中断: error decoding response body".into());
+        log.record(broken);
+
+        let rows = log.list(10);
+        let failed = rows.iter().find(|row| row.record.status == 502).unwrap();
+        assert_eq!(failed.cost_usd, Some(0.0));
+        assert_eq!(failed.record.input_tokens, 1000, "tokens are kept for diagnosis");
+        let ok = rows.iter().find(|row| row.record.status == 200).unwrap();
+        assert!((ok.cost_usd.unwrap() - 0.0525).abs() < 1e-9);
+        assert_eq!(log.get(failed.record.id).unwrap().view.cost_usd, Some(0.0));
+
+        let summary = log.summary();
+        assert_eq!((summary.requests, summary.errors), (2, 1));
+        assert!((summary.cost_usd - 0.0525).abs() < 1e-9, "{}", summary.cost_usd);
+    }
+
+    #[test]
+    fn old_failed_tokens_are_removed_from_totals_once() {
+        let log = UsageLog::open(None);
+        log.record(sample("claude-opus-5-5", 200));
+        log.record(sample("Claude-Opus-5-5", 502));
+        {
+            // 模拟升级前：失败 token 也进过汇总，且还没做过扣回
+            let conn = log.conn.lock();
+            conn.execute(
+                "UPDATE model_totals SET input_tokens = input_tokens + 1000, output_tokens = output_tokens + 500",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM meta WHERE key = 'failed_tokens_excluded'", []).unwrap();
+        }
+        assert_eq!(log.summary().input_tokens, 2000);
+        exclude_failed_tokens_from_totals(&log.conn.lock()).unwrap();
+        assert_eq!(log.summary().input_tokens, 1000);
+        assert_eq!(log.summary().output_tokens, 500);
+        exclude_failed_tokens_from_totals(&log.conn.lock()).unwrap();
+        assert_eq!(log.summary().input_tokens, 1000, "runs only once");
     }
 
     #[test]

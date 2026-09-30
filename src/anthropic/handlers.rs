@@ -98,26 +98,28 @@ fn attach_usage(
     log_ctx: RequestLogContext,
     target: crate::kiro::provider::UpstreamTarget,
     cache: Option<super::cache_emulation::CacheSplit>,
-) -> Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>> {
+) -> Option<super::stream::OnUsage> {
     let usage = usage?;
     let model = model.to_string();
     let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Some(std::sync::Arc::new(move |input_tokens, output_tokens, stop_reason, response_body| {
+    Some(std::sync::Arc::new(move |report: super::stream::UsageReport| {
         if recorded.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        // 断流按失败入库：状态 502、带错误信息，费用为 0
+        let status = if report.error.is_some() { 502 } else { 200 };
         usage.record(logged_request(
             &model,
             true,
-            200,
+            status,
             started,
-            input_tokens as i64,
-            output_tokens as i64,
-            None,
-            stop_reason,
+            report.input_tokens as i64,
+            report.output_tokens as i64,
+            report.error,
+            report.stop_reason,
             &log_ctx,
             Some(&target),
-            &response_body,
+            &report.response_body,
             cache.as_ref(),
         ));
     }))
@@ -709,8 +711,8 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
+                            // 断流：发 error 事件并按失败记账，不当作正常结束
+                            let final_events = ctx.fail(&e.to_string());
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1320,8 +1322,8 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                // 断流：客户端还没收到内容，只发 error 事件，按失败记账
+                                let all_events = ctx.fail(&e.to_string());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))

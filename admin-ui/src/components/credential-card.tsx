@@ -2,7 +2,8 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { getAccessGroups, setGroupMembers, type AccessGroup } from '@/api/access'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { formatCNY, formatCostRatio, getAccountCosts, setAccountCost } from '@/api/usage'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -17,7 +18,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
@@ -32,24 +33,6 @@ interface CredentialCardProps {
   onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
-  balance: BalanceResponse | null
-  loadingBalance: boolean
-}
-
-function formatLastUsed(lastUsedAt: string | null): string {
-  if (!lastUsedAt) return '从未使用'
-  const date = new Date(lastUsedAt)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  if (diff < 0) return '刚刚'
-  const seconds = Math.floor(diff / 1000)
-  if (seconds < 60) return `${seconds} 秒前`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes} 分钟前`
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return `${hours} 小时前`
-  const days = Math.floor(hours / 24)
-  return `${days} 天前`
 }
 
 export function CredentialCard({
@@ -57,11 +40,12 @@ export function CredentialCard({
   onViewBalance,
   selected,
   onToggleSelect,
-  balance,
-  loadingBalance,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [editingCost, setEditingCost] = useState(false)
+  const [costValue, setCostValue] = useState('')
+  const [costSaving, setCostSaving] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [groupOpen, setGroupOpen] = useState(false)
   const [groupDraft, setGroupDraft] = useState<string[]>([])
@@ -69,6 +53,34 @@ export function CredentialCard({
   const queryClient = useQueryClient()
   const accessGroups = useQuery({ queryKey: ['access-groups'], queryFn: getAccessGroups })
   const joined = (accessGroups.data ?? []).filter((group) => group.members.includes(credential.id))
+  // 与价格页共用同一份账号成本数据；消耗按当前单价重算
+  const accountCosts = useQuery({ queryKey: ['usage-accounts'], queryFn: getAccountCosts })
+  const cost = accountCosts.data?.accounts.find((row) => row.credentialId === credential.id)
+
+  const startEditCost = () => {
+    setCostValue(cost?.costCny == null ? '' : String(cost.costCny))
+    setEditingCost(true)
+  }
+
+  const saveCost = async () => {
+    const raw = costValue.trim()
+    const value = raw === '' ? null : Number(raw)
+    if (value !== null && (Number.isNaN(value) || value < 0)) {
+      toast.error('成本要是非负数字；留空表示未知')
+      return
+    }
+    setCostSaving(true)
+    try {
+      const next = await setAccountCost(credential.id, value)
+      queryClient.setQueryData(['usage-accounts'], next)
+      setEditingCost(false)
+      toast.success(value === null ? '已清空账号成本' : '已保存账号成本')
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    } finally {
+      setCostSaving(false)
+    }
+  }
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -288,65 +300,63 @@ export function CredentialCard({
               )}
             </div>
             <div>
-              <span className="text-muted-foreground">失败次数：</span>
-              <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
-                {credential.failureCount}
-              </span>
+              <span className="text-muted-foreground">账号成本：</span>
+              {editingCost ? (
+                <div className="inline-flex items-center gap-1 ml-1">
+                  <Input
+                    inputMode="decimal"
+                    value={costValue}
+                    onChange={(e) => setCostValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') saveCost()
+                      if (e.key === 'Escape') setEditingCost(false)
+                    }}
+                    placeholder="人民币"
+                    aria-label="账号人民币成本"
+                    className="w-24 h-7 text-sm"
+                    autoFocus
+                  />
+                  <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={saveCost} disabled={costSaving} aria-label="保存成本">
+                    ✓
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-7 w-7 p-0" onClick={() => setEditingCost(false)} aria-label="取消">
+                    ✕
+                  </Button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="font-medium underline decoration-dotted underline-offset-4 hover:decoration-solid ml-1"
+                  onClick={startEditCost}
+                  title="点击编辑。留空表示未知，填 0 表示免费账号"
+                >
+                  {cost?.costCny == null ? '未填' : formatCNY(cost.costCny)}
+                </button>
+              )}
             </div>
             <div>
-              <span className="text-muted-foreground">刷新失败：</span>
-              <span className={credential.refreshFailureCount > 0 ? 'text-red-500 font-medium' : ''}>
-                {credential.refreshFailureCount}
-              </span>
+              <span className="text-muted-foreground">总消耗：</span>
+              <span className="font-medium">{cost ? `$${cost.usageUsd.toFixed(4)}` : '—'}</span>
             </div>
             <div>
-              <span className="text-muted-foreground">订阅等级：</span>
-              <span className="font-medium">
-                {loadingBalance ? (
-                  <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
-              </span>
+              <span className="text-muted-foreground" title="账号成本 ¥ ÷ 总消耗 $">成本倍率：</span>
+              <span className="font-medium">{formatCostRatio(cost?.costRatio)}</span>
             </div>
-            <div>
-              <span className="text-muted-foreground">成功次数：</span>
-              <span className="font-medium">{credential.successCount}</span>
-            </div>
-            <div className="col-span-2">
-              <span className="text-muted-foreground">最后调用：</span>
-              <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
-            </div>
+            {cost && cost.unpricedRequests > 0 ? (
+              <div className="col-span-2 text-xs text-muted-foreground">
+                有 {cost.unpricedRequests} 条请求的模型没有单价，没算进总消耗
+              </div>
+            ) : null}
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>
                 <span className="font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
-              {loadingBalance ? (
-                <span className="text-sm ml-1">
-                  <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
-                </span>
-              ) : balance ? (
-                <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
-                  <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
-                  </span>
-                </span>
-              ) : (
-                <span className="text-sm text-muted-foreground ml-1">未知</span>
-              )}
-            </div>
             {credential.hasProxy && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">代理：</span>
                 <span className="font-medium">{credential.proxyUrl}</span>
-              </div>
-            )}
-            {credential.hasProfileArn && (
-              <div className="col-span-2">
-                <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}
           </div>

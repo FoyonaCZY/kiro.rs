@@ -505,6 +505,34 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
+/// 一次流式请求结束时交给用量记录的内容
+#[derive(Debug, Clone)]
+pub struct UsageReport {
+    /// 输入总数（contextUsageEvent 换算值，没有时用估算）
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub stop_reason: String,
+    pub response_body: String,
+    /// 上游流中途失败时的原因。有值时按失败入库，不计费
+    pub error: Option<String>,
+}
+
+pub type OnUsage = std::sync::Arc<dyn Fn(UsageReport) + Send + Sync>;
+
+/// 上游流中途断开时发给客户端的错误事件，格式同 Anthropic 流式错误
+fn stream_error_event() -> SseEvent {
+    SseEvent::new(
+        "error",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": "Upstream stream was interrupted before the response finished. Please retry."
+            }
+        }),
+    )
+}
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -542,7 +570,7 @@ pub struct StreamContext {
     reasoning_block_open: bool,
     answer_text: String,
     thinking_text: String,
-    on_usage: Option<std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>>,
+    on_usage: Option<OnUsage>,
     /// 模拟缓存的命中比例，None 表示未开启或本请求不可缓存
     cache: Option<super::cache_emulation::CacheSplit>,
 }
@@ -579,7 +607,7 @@ impl StreamContext {
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: OnUsage) {
         self.on_usage = Some(callback);
     }
 
@@ -1241,13 +1269,14 @@ impl StreamContext {
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
         let output_tokens = self.output_tokens;
-        if let Some(callback) = self.on_usage.clone() {
-            callback(
-                final_input_tokens,
+        if let Some(callback) = self.on_usage.take() {
+            callback(UsageReport {
+                input_tokens: final_input_tokens,
                 output_tokens,
-                self.state_manager.get_stop_reason(),
-                self.assembled_response(),
-            );
+                stop_reason: self.state_manager.get_stop_reason(),
+                response_body: self.assembled_response(),
+                error: None,
+            });
         }
 
         // 生成最终事件
@@ -1257,6 +1286,21 @@ impl StreamContext {
                 .generate_final_events(usage),
         );
         events
+    }
+
+    /// 上游流中途失败：给客户端发 error 事件，不发 message_delta / message_stop，
+    /// 客户端会把这次回复当作失败处理而不是正常结束。用量按失败入库，不计费。
+    pub fn fail(&mut self, reason: &str) -> Vec<SseEvent> {
+        if let Some(callback) = self.on_usage.take() {
+            callback(UsageReport {
+                input_tokens: self.context_input_tokens.unwrap_or(self.input_tokens),
+                output_tokens: self.output_tokens,
+                stop_reason: String::new(),
+                response_body: self.assembled_response(),
+                error: Some(format!("上游流中断: {reason}")),
+            });
+        }
+        vec![stream_error_event()]
     }
 }
 
@@ -1299,8 +1343,15 @@ impl BufferedStreamContext {
         }
     }
 
-    pub fn set_on_usage(&mut self, callback: std::sync::Arc<dyn Fn(i32, i32, String, String) + Send + Sync>) {
+    pub fn set_on_usage(&mut self, callback: OnUsage) {
         self.inner.on_usage = Some(callback);
+    }
+
+    /// 上游流中途失败。缓冲模式下客户端还没收到任何内容，只发一个 error 事件，
+    /// 丢掉已缓冲的半截回复，客户端可以直接重试。
+    pub fn fail(&mut self, reason: &str) -> Vec<SseEvent> {
+        self.event_buffer.clear();
+        self.inner.fail(reason)
     }
 
     pub fn set_cache(&mut self, cache: Option<super::cache_emulation::CacheSplit>) {
@@ -2322,6 +2373,64 @@ mod tests {
         assert_eq!(cached_input(start), cached_input(delta), "start and delta agree");
         assert_eq!(start["cache_creation"]["ephemeral_1h_input_tokens"], start["cache_creation_input_tokens"]);
         assert_eq!(start["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+    }
+
+    fn capture() -> (OnUsage, std::sync::Arc<parking_lot::Mutex<Vec<UsageReport>>>) {
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let callback: OnUsage = std::sync::Arc::new(move |report| sink.lock().push(report));
+        (callback, seen)
+    }
+
+    #[test]
+    fn interrupted_stream_sends_error_and_reports_failure_once() {
+        let (callback, seen) = capture();
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5-5", 1000, false, HashMap::new());
+        ctx.set_on_usage(callback);
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&answer("half an ans")));
+        let tail = ctx.fail("error decoding response body");
+
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].event, "error");
+        assert_eq!(tail[0].data["error"]["type"], "api_error");
+        assert!(
+            !events.iter().chain(tail.iter()).any(|e| e.event == "message_stop" || e.event == "message_delta"),
+            "an interrupted stream must not look like a normal end"
+        );
+        // 之后即使再走一次收尾，也不会再记一次用量
+        ctx.generate_final_events();
+        let reports = seen.lock();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].error.as_deref().unwrap().contains("error decoding response body"));
+        assert_eq!(reports[0].input_tokens, 1000);
+        assert!(reports[0].response_body.contains("half an ans"));
+    }
+
+    #[test]
+    fn interrupted_buffered_stream_drops_partial_reply() {
+        let (callback, seen) = capture();
+        let mut ctx = BufferedStreamContext::new("claude-opus-5-5", 1000, false, HashMap::new());
+        ctx.set_on_usage(callback);
+        ctx.process_and_buffer(&answer("partial"));
+        let events = ctx.fail("reset by peer");
+        assert_eq!(events.len(), 1, "no message_start or partial text is sent");
+        assert_eq!(events[0].event, "error");
+        assert!(seen.lock()[0].error.is_some());
+    }
+
+    #[test]
+    fn normal_stream_reports_success() {
+        let (callback, seen) = capture();
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-5-5", 1000, false, HashMap::new());
+        ctx.set_on_usage(callback);
+        ctx.generate_initial_events();
+        ctx.process_kiro_event(&answer("done"));
+        let events = ctx.generate_final_events();
+        assert!(events.iter().any(|e| e.event == "message_stop"));
+        let reports = seen.lock();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].error.is_none());
     }
 
     #[test]
