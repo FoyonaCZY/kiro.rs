@@ -91,6 +91,8 @@ export interface UpdateCredentialRequest {
   clientId?: string
   clientSecret?: string
   machineId?: string
+  claudeBaseUrl?: string
+  claudeApiKey?: string
 }
 
 // 添加凭据请求

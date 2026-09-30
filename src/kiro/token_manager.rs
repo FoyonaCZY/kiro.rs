@@ -1697,12 +1697,13 @@ impl MultiTokenManager {
             .filter(|e| !e.disabled && e.id != *current_id)
             .min_by_key(|e| e.credentials.priority)
         {
-            *current_id = next.id;
-            tracing::info!(
-                "已切换到凭据 #{}（优先级 {}）",
-                next.id,
-                next.credentials.priority
-            );
+            let next_id = next.id;
+            let next_priority = next.credentials.priority;
+            *current_id = next_id;
+            if let Some(group) = crate::access::current_group() {
+                self.group_sticky.lock().insert(group, next_id);
+            }
+            tracing::info!("已切换到凭据 #{}（优先级 {}）", next_id, next_priority);
             true
         } else {
             // 没有其他可用凭据，检查当前凭据是否可用

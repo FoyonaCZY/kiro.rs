@@ -239,7 +239,10 @@ export function CredentialCard({
                      credential.authMethod}
                   </Badge>
                 )}
-                {credential.endpoint && (
+                {credential.authMethod === 'claude_api' && credential.claudeBaseUrl && (
+                  <Badge variant="outline">{credential.claudeBaseUrl}</Badge>
+                )}
+                {credential.endpoint && credential.authMethod !== 'claude_api' && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
                 {(joined.length > 0 ? joined : [{ id: 'default', name: '默认' } as AccessGroup]).map((group) => (
@@ -378,6 +381,7 @@ export function CredentialCard({
               <RefreshCw className="h-4 w-4 mr-1" />
               重置失败
             </Button>
+            {credential.authMethod !== 'claude_api' && (
             <Button
               size="sm"
               variant="outline"
@@ -388,6 +392,7 @@ export function CredentialCard({
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
             </Button>
+            )}
             <Button
               size="sm"
               variant="outline"
@@ -424,6 +429,7 @@ export function CredentialCard({
               <ChevronDown className="h-4 w-4 mr-1" />
               降低优先级
             </Button>
+            {credential.authMethod !== 'claude_api' && (
             <Button
               size="sm"
               variant="default"
@@ -432,6 +438,7 @@ export function CredentialCard({
               <Wallet className="h-4 w-4 mr-1" />
               查看余额
             </Button>
+            )}
             <Button
               size="sm"
               variant="outline"

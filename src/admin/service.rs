@@ -144,11 +144,19 @@ impl AdminService {
                         method.eq_ignore_ascii_case("api_key")
                             || method.eq_ignore_ascii_case("apikey")
                     });
-                let endpoint = crate::kiro::endpoint::effective_endpoint_name(
-                    entry.endpoint.as_deref(),
-                    &default_endpoint,
-                    api_key,
-                );
+                let endpoint = if entry
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("claude_api"))
+                {
+                    String::new()
+                } else {
+                    crate::kiro::endpoint::effective_endpoint_name(
+                        entry.endpoint.as_deref(),
+                        &default_endpoint,
+                        api_key,
+                    )
+                };
                 CredentialStatusItem {
                     cooldown_remaining_seconds: entry.cooldown_remaining_seconds,
                     id: entry.id,
@@ -277,7 +285,22 @@ impl AdminService {
     }
 
     /// 获取凭据余额（带缓存）
+    fn is_claude_api(&self, id: u64) -> bool {
+        self.token_manager.snapshot().entries.iter().any(|entry| {
+            entry.id == id
+                && entry
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("claude_api"))
+        })
+    }
+
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        if self.is_claude_api(id) {
+            return Err(AdminServiceError::InvalidCredential(
+                "Claude API 账号没有 Kiro 余额".to_string(),
+            ));
+        }
         // 先查缓存
         {
             let cache = self.balance_cache.lock();
@@ -520,6 +543,11 @@ impl AdminService {
 
     /// 强制刷新指定凭据的 Token
     pub async fn force_refresh_token(&self, id: u64) -> Result<(), AdminServiceError> {
+        if self.is_claude_api(id) {
+            return Err(AdminServiceError::InvalidCredential(
+                "Claude API 账号没有 Token 可刷新".to_string(),
+            ));
+        }
         self.token_manager
             .force_refresh_token_for(id)
             .await

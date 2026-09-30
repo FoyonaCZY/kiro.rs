@@ -485,6 +485,7 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut last_target: Option<UpstreamTarget> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut claude_tried: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -500,22 +501,23 @@ impl KiroProvider {
             };
 
             if ctx.credentials.is_claude_api_credential() {
-                let Some(forward) = forward else {
+                if claude_tried.contains(&ctx.id) || forward.is_none() {
                     self.token_manager.switch_to_next();
+                    if claude_tried.len() >= total_credentials {
+                        break;
+                    }
                     continue;
-                };
+                }
+                let forward = forward.unwrap();
+                claude_tried.insert(ctx.id);
                 match self.forward_claude(&ctx, forward, is_stream).await {
                     Ok(response) => {
                         let status = response.status();
-                        let retry = status.as_u16() == 429
-                            || status.is_server_error()
-                            || matches!(status.as_u16(), 401 | 403 | 408);
-                        if !retry {
-                            if status.is_success() {
-                                self.token_manager.report_success(ctx.id);
-                            }
+                        if status.is_success() {
+                            self.token_manager.report_success(ctx.id);
                             return Ok(self.claude_upstream(ctx.id, &ctx.credentials, response));
                         }
+                        tracing::warn!("Claude API 账号 #{} 返回 {}，换下一个账号", ctx.id, status);
                         if status.as_u16() == 429 {
                             let cooldown = Self::rate_limit_delay(
                                 response.headers(),
@@ -530,22 +532,24 @@ impl KiroProvider {
                                 }
                                 .into(),
                             );
-                        } else {
+                        } else if matches!(status.as_u16(), 401 | 403) {
                             self.token_manager.report_failure(ctx.id);
+                            last_error = Some(anyhow::anyhow!("Claude API {status}"));
+                        } else {
                             last_error = Some(anyhow::anyhow!("Claude API {status}"));
                         }
                         let _ = response.bytes().await;
+                        self.token_manager.switch_to_next();
                         continue;
                     }
                     Err(err) => {
                         tracing::warn!(
-                            "Claude API 转发失败（尝试 {}/{}）: {}",
-                            attempt + 1,
-                            max_retries,
+                            "Claude API 账号 #{} 转发失败，换下一个账号: {}",
+                            ctx.id,
                             err
                         );
                         last_error = Some(err);
-                        self.token_manager.report_failure(ctx.id);
+                        self.token_manager.switch_to_next();
                         continue;
                     }
                 }

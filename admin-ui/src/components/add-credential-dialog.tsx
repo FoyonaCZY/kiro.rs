@@ -211,6 +211,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
+            {authMethod !== 'claude_api' && ( <>
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
@@ -322,6 +323,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
               </p>
             </div>
+
+            </> )}
 
             {/* 代理配置 */}
             <div className="space-y-2">

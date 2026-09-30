@@ -44,6 +44,8 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [machineId, setMachineId] = useState('')
+  const [claudeBaseUrl, setClaudeBaseUrl] = useState('')
+  const [claudeApiKey, setClaudeApiKey] = useState('')
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -61,6 +63,8 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
     setClientId(credential.clientId ?? '')
     setClientSecret('')
     setMachineId(credential.machineId ?? '')
+    setClaudeBaseUrl(credential.claudeBaseUrl ?? '')
+    setClaudeApiKey('')
   }, [open, credential])
 
   const save = async () => {
@@ -69,15 +73,21 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
       toast.error('优先级必须是非负整数')
       return
     }
+    const isClaude = credential.authMethod === 'claude_api'
     const body: UpdateCredentialRequest = {
       email: email.trim(),
       priority: priorityValue,
-      endpoint: endpoint.trim(),
-      region: region.trim(),
-      authRegion: authRegion.trim(),
-      apiRegion: apiRegion.trim(),
-      clientId: clientId.trim(),
-      machineId: machineId.trim(),
+    }
+    if (isClaude) {
+      if (claudeBaseUrl.trim()) body.claudeBaseUrl = claudeBaseUrl.trim()
+      if (claudeApiKey.trim()) body.claudeApiKey = claudeApiKey.trim()
+    } else {
+      body.endpoint = endpoint.trim()
+      body.region = region.trim()
+      body.authRegion = authRegion.trim()
+      body.apiRegion = apiRegion.trim()
+      body.clientId = clientId.trim()
+      body.machineId = machineId.trim()
     }
     const proxyText = proxyUrl.trim()
     if (isFullProxyLine(proxyText)) {
@@ -111,7 +121,7 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
         <DialogHeader>
           <DialogTitle>编辑凭据</DialogTitle>
           <DialogDescription>
-            {credential.email || `凭据 #${credential.id}`}。保存后立即生效，不用重启。密码和 Refresh Token 留空表示不改。
+            {credential.email || `凭据 #${credential.id}`}。保存后立即生效，不用重启。密码、密钥和 Refresh Token 留空表示不改。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 text-sm">
@@ -121,6 +131,28 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
           <Field label="优先级">
             <Input type="number" min="0" value={priority} onChange={(event) => setPriority(event.target.value)} />
           </Field>
+          {credential.authMethod === 'claude_api' ? (
+            <>
+              <Field label="Claude API 地址">
+                <Input
+                  value={claudeBaseUrl}
+                  onChange={(event) => setClaudeBaseUrl(event.target.value)}
+                  placeholder="https://api.anthropic.com"
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="Claude API Key">
+                <Input
+                  type="password"
+                  value={claudeApiKey}
+                  onChange={(event) => setClaudeApiKey(event.target.value)}
+                  placeholder={credential.hasClaudeApiKey ? '已保存，留空不改' : '必填'}
+                  autoComplete="new-password"
+                />
+              </Field>
+            </>
+          ) : (
+            <>
           <Field label="端点">
             <select
               className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
@@ -143,6 +175,8 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
               <Input value={apiRegion} onChange={(event) => setApiRegion(event.target.value)} placeholder="留空回退" />
             </Field>
           </div>
+            </>
+          )}
           <Field label="代理">
             <Input
               value={proxyUrl}
@@ -168,7 +202,7 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
               />
             </Field>
           </div>
-          {!isApiKey && (
+          {!isApiKey && credential.authMethod !== 'claude_api' && (
             <Field label="Refresh Token">
               <Input
                 type="password"
@@ -195,9 +229,11 @@ export function EditCredentialDialog({ credential, open, onOpenChange }: EditCre
               </Field>
             </>
           )}
-          <Field label="Machine ID">
-            <Input value={machineId} onChange={(event) => setMachineId(event.target.value)} placeholder="64 位十六进制或 UUID，留空不改" />
-          </Field>
+          {credential.authMethod !== 'claude_api' && (
+            <Field label="Machine ID">
+              <Input value={machineId} onChange={(event) => setMachineId(event.target.value)} placeholder="64 位十六进制或 UUID，留空不改" />
+            </Field>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>取消</Button>
