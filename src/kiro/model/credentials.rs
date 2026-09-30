@@ -103,6 +103,17 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
 
+    /// Claude Messages API 的根地址，例如 https://api.anthropic.com。
+    /// 选中这种账号时，请求和响应都按 Anthropic 原文转发，不转成 Kiro。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_base_url: Option<String>,
+
+    /// Claude Messages API 的 x-api-key。不回给管理界面。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_api_key: Option<String>,
+
     /// 端点名称（可选）
     ///
     /// 决定该凭据走哪套 Kiro API。OAuth 未配置时走 `krs`，API Key 固定走 `ide`。
@@ -273,6 +284,45 @@ impl KiroCredentials {
                 .unwrap_or(false)
     }
 
+    /// 直接转发到 Claude Messages API 的账号，和 Kiro 账号放在同一个调度池里。
+    pub fn is_claude_api_credential(&self) -> bool {
+        self.auth_method.as_deref().is_some_and(|method| {
+            method.eq_ignore_ascii_case("claude_api")
+                || method.eq_ignore_ascii_case("claude-api")
+                || method.eq_ignore_ascii_case("messages")
+        })
+    }
+
+    /// `{base}/v1/messages`。base 末尾如果已经带了这个路径，不重复拼接。
+    pub fn claude_messages_url(&self) -> anyhow::Result<String> {
+        let base = self
+            .claude_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Claude API 账号缺少地址"))?;
+        claude_messages_url(base)
+    }
+}
+
+pub fn claude_messages_url(base: &str) -> anyhow::Result<String> {
+    let base = base.trim().trim_end_matches('/');
+    if !(base.starts_with("https://") || base.starts_with("http://")) {
+        anyhow::bail!("Claude API 地址要以 http:// 或 https:// 开头");
+    }
+    if base.contains('@') {
+        anyhow::bail!("Claude API 地址不要带账号密码，密钥单独填写");
+    }
+    if let Some(root) = base.strip_suffix("/v1/messages") {
+        return Ok(format!("{root}/v1/messages"));
+    }
+    if let Some(root) = base.strip_suffix("/v1") {
+        return Ok(format!("{root}/v1/messages"));
+    }
+    Ok(format!("{base}/v1/messages"))
+}
+
+impl KiroCredentials {
     /// 上游 Q API 的 `TokenType`。Social 不发送。
     ///
     /// 对齐 Kiro IDE 1.1.70：`api_key` → `API_KEY`，`idc` → `SSO_OIDC`，
@@ -468,6 +518,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            claude_base_url: None,
+            claude_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -586,6 +638,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            claude_base_url: None,
+            claude_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -617,6 +671,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            claude_base_url: None,
+            claude_api_key: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -731,6 +787,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            claude_base_url: None,
+            claude_api_key: None,
         };
 
         let json = original.to_pretty_json().unwrap();
@@ -1025,5 +1083,31 @@ mod tests {
 
         assert!(parse_proxy_line("ftp://gate.example:1000").is_err());
         assert!(parse_proxy_line("socks5://gate.example:0").is_err());
+    }
+
+    #[test]
+    fn test_claude_messages_url_normalizes_base() {
+        assert_eq!(
+            claude_messages_url("https://api.anthropic.com").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            claude_messages_url("https://api.anthropic.com/v1/").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            claude_messages_url("https://example.com/v1/messages").unwrap(),
+            "https://example.com/v1/messages"
+        );
+        assert!(claude_messages_url("api.anthropic.com").is_err());
+        let mut cred = KiroCredentials::default();
+        cred.auth_method = Some("claude_api".into());
+        cred.claude_base_url = Some("https://api.anthropic.com".into());
+        assert!(cred.is_claude_api_credential());
+        assert!(!cred.is_api_key_credential());
+        assert_eq!(
+            cred.claude_messages_url().unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 }

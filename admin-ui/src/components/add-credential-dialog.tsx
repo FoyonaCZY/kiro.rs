@@ -17,11 +17,13 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'claude_api'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
+  const [claudeBaseUrl, setClaudeBaseUrl] = useState('https://api.anthropic.com')
+  const [claudeApiKey, setClaudeApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
@@ -39,6 +41,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setKiroApiKey('')
+    setClaudeBaseUrl('https://api.anthropic.com')
+    setClaudeApiKey('')
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
@@ -58,7 +62,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     e.preventDefault()
 
     // 验证必填字段
-    if (isApiKey) {
+    if (authMethod === 'claude_api') {
+      if (!claudeBaseUrl.trim() || !claudeApiKey.trim()) {
+        toast.error('请填写 Claude API 地址和密钥')
+        return
+      }
+    } else if (isApiKey) {
       if (!kiroApiKey.trim()) {
         toast.error('请输入 Kiro API Key')
         return
@@ -85,6 +94,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
+        claudeBaseUrl: authMethod === 'claude_api' ? claudeBaseUrl.trim() : undefined,
+        claudeApiKey: authMethod === 'claude_api' ? claudeApiKey.trim() : undefined,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -128,6 +139,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
                 <option value="api_key">API Key</option>
+                <option value="claude_api">Claude API</option>
               </select>
             </div>
 
@@ -148,8 +160,42 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
+            {authMethod === 'claude_api' && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="claudeBaseUrl" className="text-sm font-medium">
+                    Claude API 地址 <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="claudeBaseUrl"
+                    placeholder="https://api.anthropic.com"
+                    value={claudeBaseUrl}
+                    onChange={(e) => setClaudeBaseUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    选中这个账号时，/v1/messages 的请求和响应原样转发，不转成 Kiro。
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="claudeApiKey" className="text-sm font-medium">
+                    Claude API Key <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="claudeApiKey"
+                    type="password"
+                    placeholder="上游密钥"
+                    value={claudeApiKey}
+                    onChange={(e) => setClaudeApiKey(e.target.value)}
+                    disabled={isPending}
+                    autoComplete="new-password"
+                  />
+                </div>
+              </>
+            )}
+
             {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && (
+            {authMethod !== 'api_key' && authMethod !== 'claude_api' && (
               <div className="space-y-2">
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>

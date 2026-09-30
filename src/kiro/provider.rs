@@ -42,6 +42,32 @@ pub struct UpstreamTarget {
 pub struct UpstreamResponse {
     pub response: reqwest::Response,
     pub target: UpstreamTarget,
+    /// 上游已经是 Anthropic Messages 响应，调用方要原样返回，不能再按 Kiro 事件解析。
+    pub passthrough: bool,
+}
+
+/// 选中 Claude Messages API 账号时，用客户端原始请求做双向转发。
+#[derive(Clone, Copy)]
+pub struct ClaudeForward<'a> {
+    pub body: &'a str,
+    pub anthropic_version: Option<&'a str>,
+    pub anthropic_beta: Option<&'a str>,
+}
+
+pub struct ClaudeForwardOwned {
+    pub body: String,
+    pub anthropic_version: Option<String>,
+    pub anthropic_beta: Option<String>,
+}
+
+impl ClaudeForwardOwned {
+    pub fn as_forward(&self) -> ClaudeForward<'_> {
+        ClaudeForward {
+            body: &self.body,
+            anthropic_version: self.anthropic_version.as_deref(),
+            anthropic_beta: self.anthropic_beta.as_deref(),
+        }
+    }
 }
 
 /// 上游失败。Display 只保留原始错误文本，方便按上游错误码识别。
@@ -190,12 +216,32 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
-        self.call_api_with_retry(request_body, false).await
+        self.call_api_with_retry(request_body, false, None).await
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<UpstreamResponse> {
-        self.call_api_with_retry(request_body, true).await
+        self.call_api_with_retry(request_body, true, None).await
+    }
+
+    /// 和 Kiro 账号同一套重试。选中 Claude 账号时转发原始请求，选中 Kiro 账号时走原来的转换结果。
+    pub async fn call_messages(
+        &self,
+        kiro_body: &str,
+        forward: ClaudeForward<'_>,
+        is_stream: bool,
+    ) -> anyhow::Result<UpstreamResponse> {
+        self.call_api_with_retry(kiro_body, is_stream, Some(forward))
+            .await
+    }
+
+    pub fn has_claude_api(&self) -> bool {
+        self.token_manager.snapshot().entries.iter().any(|entry| {
+            entry
+                .auth_method
+                .as_deref()
+                .is_some_and(|method| method.eq_ignore_ascii_case("claude_api"))
+        })
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -373,10 +419,66 @@ impl KiroProvider {
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
     /// - 硬上限 9 次，避免无限重试
+    async fn forward_claude(
+        &self,
+        ctx: &crate::kiro::token_manager::CallContext,
+        forward: ClaudeForward<'_>,
+        is_stream: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = ctx.credentials.claude_messages_url()?;
+        let key = ctx
+            .credentials
+            .claude_api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Claude API 账号缺少 API Key"))?;
+        let version = forward.anthropic_version.unwrap_or("2023-06-01");
+        let mut request = self
+            .client_for(&ctx.credentials)?
+            .post(url)
+            .header("content-type", "application/json")
+            .header("x-api-key", key)
+            .header("anthropic-version", version)
+            .body(forward.body.to_string());
+        if is_stream {
+            request = request.header("accept", "text/event-stream");
+        }
+        if let Some(beta) = forward.anthropic_beta.filter(|value| !value.is_empty()) {
+            request = request.header("anthropic-beta", beta);
+        }
+        request.send().await.map_err(Into::into)
+    }
+
+    fn claude_upstream(
+        &self,
+        id: u64,
+        credentials: &crate::kiro::model::credentials::KiroCredentials,
+        response: reqwest::Response,
+    ) -> UpstreamResponse {
+        let account = credentials
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|email| !email.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("#{id}"));
+        UpstreamResponse {
+            response,
+            target: UpstreamTarget {
+                credential_id: id,
+                account,
+                endpoint: "claude".to_string(),
+                outbound_headers: String::new(),
+            },
+            passthrough: true,
+        }
+    }
+
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
+        forward: Option<ClaudeForward<'_>>,
     ) -> anyhow::Result<UpstreamResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -396,6 +498,66 @@ impl KiroProvider {
                     return Err(e);
                 }
             };
+
+            if ctx.credentials.is_claude_api_credential() {
+                let Some(forward) = forward else {
+                    self.token_manager.switch_to_next();
+                    continue;
+                };
+                match self.forward_claude(&ctx, forward, is_stream).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        let retry = status.as_u16() == 429
+                            || status.is_server_error()
+                            || matches!(status.as_u16(), 401 | 403 | 408);
+                        if !retry {
+                            if status.is_success() {
+                                self.token_manager.report_success(ctx.id);
+                            }
+                            return Ok(self.claude_upstream(ctx.id, &ctx.credentials, response));
+                        }
+                        if status.as_u16() == 429 {
+                            let cooldown = Self::rate_limit_delay(
+                                response.headers(),
+                                Duration::from_secs(
+                                    self.token_manager.config().rate_limit_cooldown_secs,
+                                ),
+                            );
+                            self.token_manager.report_rate_limited(ctx.id, cooldown);
+                            last_error = Some(
+                                CredentialsCoolingDown {
+                                    retry_after: cooldown,
+                                }
+                                .into(),
+                            );
+                        } else {
+                            self.token_manager.report_failure(ctx.id);
+                            last_error = Some(anyhow::anyhow!("Claude API {status}"));
+                        }
+                        let _ = response.bytes().await;
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Claude API 转发失败（尝试 {}/{}）: {}",
+                            attempt + 1,
+                            max_retries,
+                            err
+                        );
+                        last_error = Some(err);
+                        self.token_manager.report_failure(ctx.id);
+                        continue;
+                    }
+                }
+            }
+
+            if request_body.is_empty() {
+                self.token_manager.switch_to_next();
+                last_error = Some(anyhow::anyhow!(
+                    "请求无法转换成 Kiro，且当前账号不是 Claude API"
+                ));
+                continue;
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -457,7 +619,11 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(UpstreamResponse { response, target });
+                return Ok(UpstreamResponse {
+                    response,
+                    target,
+                    passthrough: false,
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息

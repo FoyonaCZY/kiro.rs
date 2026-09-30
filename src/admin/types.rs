@@ -82,6 +82,9 @@ pub struct CredentialStatusItem {
     pub has_refresh_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_base_url: Option<String>,
+    pub has_claude_api_key: bool,
 }
 
 // ============ 操作请求 ============
@@ -157,6 +160,14 @@ pub struct AddCredentialRequest {
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// Claude Messages API 根地址。authMethod=claude_api 时必填。
+    #[serde(default)]
+    pub claude_base_url: Option<String>,
+
+    /// Claude Messages API 的 x-api-key。authMethod=claude_api 时必填。
+    #[serde(default)]
+    pub claude_api_key: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -183,6 +194,10 @@ pub struct UpdateCredentialRequest {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub machine_id: Option<String>,
+    /// 空字符串表示不改。
+    pub claude_base_url: Option<String>,
+    /// 空字符串表示不改。
+    pub claude_api_key: Option<String>,
 }
 
 /// 添加凭据成功响应

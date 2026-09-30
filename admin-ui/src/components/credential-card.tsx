@@ -235,6 +235,7 @@ export function CredentialCard({
                     {credential.authMethod === 'api_key' ? 'API Key' :
                      credential.authMethod === 'idc' ? 'IdC' :
                      credential.authMethod === 'social' ? 'Social' :
+                     credential.authMethod === 'claude_api' ? 'Claude API' :
                      credential.authMethod}
                   </Badge>
                 )}

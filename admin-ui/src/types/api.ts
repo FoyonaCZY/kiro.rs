@@ -29,6 +29,8 @@ export interface CredentialStatusItem {
   disabledReason?: string
   endpoint: string
   configuredEndpoint?: string
+  claudeBaseUrl?: string
+  hasClaudeApiKey?: boolean
   proxyUsername?: string
   hasProxyPassword?: boolean
   region?: string
@@ -94,7 +96,7 @@ export interface UpdateCredentialRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'claude_api'
   clientId?: string
   clientSecret?: string
   priority?: number
@@ -105,6 +107,8 @@ export interface AddCredentialRequest {
   proxyUsername?: string
   proxyPassword?: string
   kiroApiKey?: string
+  claudeBaseUrl?: string
+  claudeApiKey?: string
   endpoint?: string
 }
 

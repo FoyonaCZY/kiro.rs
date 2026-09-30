@@ -176,6 +176,8 @@ impl AdminService {
                     has_client_secret: entry.has_client_secret,
                     has_refresh_token: entry.has_refresh_token,
                     machine_id: entry.machine_id,
+                    claude_base_url: entry.claude_base_url,
+                    has_claude_api_key: entry.has_claude_api_key,
                     configured_endpoint: entry.endpoint.clone(),
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
@@ -252,6 +254,8 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             machine_id: req.machine_id,
+            claude_base_url: req.claude_base_url,
+            claude_api_key: req.claude_api_key,
         };
         self.token_manager
             .update_credential(id, update)
@@ -353,13 +357,14 @@ impl AdminService {
 
         // 构建凭据对象
         let email = req.email.clone();
+        let auth_method = req.auth_method.clone();
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
             refresh_token: req.refresh_token,
             profile_arn: None,
             expires_at: None,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(auth_method.clone()),
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
@@ -375,6 +380,8 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            claude_base_url: req.claude_base_url,
+            claude_api_key: req.claude_api_key,
         };
 
         // 调用 token_manager 添加凭据
@@ -384,9 +391,14 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        let is_claude = auth_method.eq_ignore_ascii_case("claude_api")
+            || auth_method.eq_ignore_ascii_case("claude-api")
+            || auth_method.eq_ignore_ascii_case("messages");
+        if !is_claude {
+            // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
+            if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+                tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+            }
         }
 
         Ok(AddCredentialResponse {
@@ -453,6 +465,8 @@ impl AdminService {
             proxy_password: pending.proxy_password,
             kiro_api_key: None,
             endpoint: None,
+            claude_base_url: None,
+            claude_api_key: None,
         };
         let mut response = self.add_credential(req).await?;
         response.message = format!(

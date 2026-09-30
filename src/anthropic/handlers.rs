@@ -485,7 +485,7 @@ pub async fn post_messages(
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    if websearch::has_web_search_tool(&payload) && !provider.has_claude_api() {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -503,6 +503,41 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
+            if provider.has_claude_api() {
+                tracing::info!("请求不能转成 Kiro，交给 Claude API 账号透传");
+                let forward = Some(owned_claude_forward(&headers, &body));
+                let log_ctx = request_log_context(&headers, body, "");
+                let usage = state.usage.clone();
+                return if payload.stream {
+                    handle_stream_request(
+                        provider,
+                        "",
+                        &payload.model,
+                        0,
+                        false,
+                        std::collections::HashMap::new(),
+                        usage,
+                        log_ctx,
+                        None,
+                        forward,
+                    )
+                    .await
+                } else {
+                    handle_non_stream_request(
+                        provider,
+                        "",
+                        &payload.model,
+                        0,
+                        false,
+                        std::collections::HashMap::new(),
+                        usage,
+                        log_ctx,
+                        None,
+                        forward,
+                    )
+                    .await
+                };
+            }
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -561,6 +596,7 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     // 模拟缓存按客户端原始请求算前缀，必须在 body 被日志上下文拿走之前
     let cache_profile = super::cache_emulation::profile(&body);
+    let forward = Some(owned_claude_forward(&headers, &body));
     let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
@@ -575,6 +611,7 @@ pub async fn post_messages(
             state.usage.clone(),
             log_ctx,
             cache_profile,
+            forward,
         )
         .await
     } else {
@@ -590,9 +627,65 @@ pub async fn post_messages(
             state.usage.clone(),
             log_ctx,
             cache_profile,
+            forward,
         )
         .await
     }
+}
+
+fn owned_claude_forward(
+    headers: &axum::http::HeaderMap,
+    body: &str,
+) -> crate::kiro::provider::ClaudeForwardOwned {
+    let text = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    crate::kiro::provider::ClaudeForwardOwned {
+        body: body.to_string(),
+        anthropic_version: text("anthropic-version"),
+        anthropic_beta: text("anthropic-beta"),
+    }
+}
+
+fn pipe_passthrough(
+    call: crate::kiro::provider::UpstreamResponse,
+    model: &str,
+    stream: bool,
+    started: std::time::Instant,
+    usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
+    log_ctx: RequestLogContext,
+) -> Response {
+    let status = call.response.status();
+    let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = call.response.headers().get("content-type").cloned();
+    if let Some(usage) = usage {
+        let error = (!status.is_success()).then(|| format!("Claude API {status}"));
+        usage.record(logged_request(
+            model,
+            stream,
+            status.as_u16(),
+            started,
+            0,
+            0,
+            error,
+            String::new(),
+            &log_ctx,
+            Some(&call.target),
+            "",
+            None,
+        ));
+    }
+    let mut response = Response::builder()
+        .status(code)
+        .body(axum::body::Body::from_stream(call.response.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    if let Some(content_type) = content_type {
+        response.headers_mut().insert("content-type", content_type);
+    }
+    response
 }
 
 /// 处理流式请求
@@ -606,16 +699,24 @@ async fn handle_stream_request(
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
     cache_profile: Option<super::cache_emulation::CacheProfile>,
+    forward: Option<crate::kiro::provider::ClaudeForwardOwned>,
 ) -> Response {
     let started = std::time::Instant::now();
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call = match provider.call_api_stream(request_body).await {
+    // 调用 Kiro API（支持多凭据故障转移）。选中 Claude 账号时原样转发。
+    let call = match forward.as_ref().map(|item| item.as_forward()) {
+        Some(forward) => provider.call_messages(request_body, forward, true).await,
+        None => provider.call_api_stream(request_body).await,
+    };
+    let call = match call {
         Ok(call) => call,
         Err(e) => {
             record_usage_error(&usage, model, true, started, &e, input_tokens, &log_ctx);
             return map_provider_error(e);
         }
     };
+    if call.passthrough {
+        return pipe_passthrough(call, model, true, started, usage, log_ctx);
+    }
     let response = call.response;
 
     // 创建流处理上下文
@@ -757,16 +858,23 @@ async fn handle_non_stream_request(
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
     cache_profile: Option<super::cache_emulation::CacheProfile>,
+    forward: Option<crate::kiro::provider::ClaudeForwardOwned>,
 ) -> Response {
     let started = std::time::Instant::now();
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call = match provider.call_api(request_body).await {
+    let call = match forward.as_ref().map(|item| item.as_forward()) {
+        Some(forward) => provider.call_messages(request_body, forward, false).await,
+        None => provider.call_api(request_body).await,
+    };
+    let call = match call {
         Ok(call) => call,
         Err(e) => {
             record_usage_error(&usage, model, false, started, &e, input_tokens, &log_ctx);
             return map_provider_error(e);
         }
     };
+    if call.passthrough {
+        return pipe_passthrough(call, model, false, started, usage, log_ctx);
+    }
     let target = call.target;
     let response = call.response;
     let cache = cache_profile.as_ref().map(super::cache_emulation::observe);
@@ -1087,7 +1195,7 @@ pub async fn post_messages_cc(
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
+    if websearch::has_web_search_tool(&payload) && !provider.has_claude_api() {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -1105,6 +1213,41 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request(&payload) {
         Ok(result) => result,
         Err(e) => {
+            if provider.has_claude_api() {
+                tracing::info!("请求不能转成 Kiro，交给 Claude API 账号透传");
+                let forward = Some(owned_claude_forward(&headers, &body));
+                let log_ctx = request_log_context(&headers, body, "");
+                let usage = state.usage.clone();
+                return if payload.stream {
+                    handle_stream_request(
+                        provider,
+                        "",
+                        &payload.model,
+                        0,
+                        false,
+                        std::collections::HashMap::new(),
+                        usage,
+                        log_ctx,
+                        None,
+                        forward,
+                    )
+                    .await
+                } else {
+                    handle_non_stream_request(
+                        provider,
+                        "",
+                        &payload.model,
+                        0,
+                        false,
+                        std::collections::HashMap::new(),
+                        usage,
+                        log_ctx,
+                        None,
+                        forward,
+                    )
+                    .await
+                };
+            }
             let (error_type, message) = match &e {
                 ConversionError::UnsupportedModel(model) => {
                     ("invalid_request_error", format!("模型不支持: {}", model))
@@ -1163,6 +1306,7 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     // 模拟缓存按客户端原始请求算前缀，必须在 body 被日志上下文拿走之前
     let cache_profile = super::cache_emulation::profile(&body);
+    let forward = Some(owned_claude_forward(&headers, &body));
     let log_ctx = request_log_context(&headers, body, &request_body);
 
     if payload.stream {
@@ -1177,6 +1321,7 @@ pub async fn post_messages_cc(
             state.usage.clone(),
             log_ctx,
             cache_profile,
+            forward,
         )
         .await
     } else {
@@ -1192,6 +1337,7 @@ pub async fn post_messages_cc(
             state.usage.clone(),
             log_ctx,
             cache_profile,
+            forward,
         )
         .await
     }
@@ -1211,10 +1357,14 @@ async fn handle_stream_request_buffered(
     usage: Option<std::sync::Arc<crate::usage_log::UsageLog>>,
     log_ctx: RequestLogContext,
     cache_profile: Option<super::cache_emulation::CacheProfile>,
+    forward: Option<crate::kiro::provider::ClaudeForwardOwned>,
 ) -> Response {
     let started = std::time::Instant::now();
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call = match provider.call_api_stream(request_body).await {
+    let call = match forward.as_ref().map(|item| item.as_forward()) {
+        Some(forward) => provider.call_messages(request_body, forward, true).await,
+        None => provider.call_api_stream(request_body).await,
+    };
+    let call = match call {
         Ok(call) => call,
         Err(e) => {
             record_usage_error(
@@ -1229,6 +1379,9 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+    if call.passthrough {
+        return pipe_passthrough(call, model, true, started, usage, log_ctx);
+    }
     let response = call.response;
 
     // 创建缓冲流处理上下文

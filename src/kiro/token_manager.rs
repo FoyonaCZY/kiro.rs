@@ -19,7 +19,9 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::credential_store::CredentialStore;
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::{CredentialsConfig, KiroCredentials, parse_proxy_line};
+use crate::kiro::model::credentials::{
+    CredentialsConfig, KiroCredentials, claude_messages_url, parse_proxy_line,
+};
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
@@ -401,6 +403,9 @@ struct CredentialEntry {
 
 impl CredentialEntry {
     fn supports_model(&self, model: Option<&str>) -> bool {
+        if self.credentials.is_claude_api_credential() {
+            return !self.disabled;
+        }
         !self.disabled
             && (!model.is_some_and(|m| m.to_ascii_lowercase().contains("opus"))
                 || self.credentials.supports_opus())
@@ -530,6 +535,9 @@ pub struct CredentialEntrySnapshot {
     pub has_refresh_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_base_url: Option<String>,
+    pub has_claude_api_key: bool,
 }
 
 /// 凭据管理器状态快照
@@ -566,6 +574,9 @@ pub struct CredentialUpdate {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub machine_id: Option<String>,
+    pub claude_base_url: Option<String>,
+    /// 空字符串表示不改。
+    pub claude_api_key: Option<String>,
 }
 
 /// 启动时加载凭据。数据库里已有数据就以数据库为准，不再读 JSON。
@@ -661,6 +672,21 @@ fn apply_credential_update(
             machine_id::normalize_machine_id(machine)
                 .ok_or_else(|| anyhow::anyhow!("Machine ID 需要是 64 位十六进制或 UUID"))?,
         );
+    }
+    if let Some(base) = &update.claude_base_url {
+        let base = base.trim();
+        if !base.is_empty() {
+            claude_messages_url(base)?;
+            cred.claude_base_url = Some(base.trim_end_matches('/').to_string());
+        }
+    }
+    if let Some(key) = update
+        .claude_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        cred.claude_api_key = Some(key.to_string());
     }
     if let Some(token) = update
         .refresh_token
@@ -1182,6 +1208,19 @@ impl MultiTokenManager {
         id: u64,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<CallContext> {
+        if credentials.is_claude_api_credential() {
+            let token = credentials
+                .claude_api_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Claude API 账号缺少 API Key"))?;
+            return Ok(CallContext {
+                id,
+                credentials: credentials.clone(),
+                token,
+            });
+        }
+
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
             let token = credentials
@@ -1743,6 +1782,12 @@ impl MultiTokenManager {
                     has_client_secret: e.credentials.client_secret.is_some(),
                     has_refresh_token: e.credentials.refresh_token.is_some(),
                     machine_id: e.credentials.machine_id.clone(),
+                    claude_base_url: e.credentials.claude_base_url.clone(),
+                    has_claude_api_key: e
+                        .credentials
+                        .claude_api_key
+                        .as_deref()
+                        .is_some_and(|key| !key.is_empty()),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| {
                         match r {
@@ -1968,7 +2013,16 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         // 1. 基本验证
-        if new_cred.is_api_key_credential() {
+        if new_cred.is_claude_api_credential() {
+            let key = new_cred
+                .claude_api_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Claude API 账号缺少 API Key"))?;
+            if key.is_empty() {
+                anyhow::bail!("Claude API Key 为空");
+            }
+            new_cred.claude_messages_url()?;
+        } else if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
                 .as_deref()
@@ -1981,7 +2035,28 @@ impl MultiTokenManager {
         }
 
         // 2. 基于哈希检测重复
-        if new_cred.is_api_key_credential() {
+        if new_cred.is_claude_api_credential() {
+            let key = new_cred
+                .claude_api_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("缺少 Claude API Key"))?;
+            let key_hash = sha256_hex(key);
+            let duplicate_exists = {
+                let entries = self.entries.lock();
+                entries.iter().any(|entry| {
+                    entry
+                        .credentials
+                        .claude_api_key
+                        .as_deref()
+                        .map(sha256_hex)
+                        .as_deref()
+                        == Some(key_hash.as_str())
+                })
+            };
+            if duplicate_exists {
+                anyhow::bail!("凭据已存在（Claude API Key 重复）");
+            }
+        } else if new_cred.is_api_key_credential() {
             let new_api_key = new_cred
                 .kiro_api_key
                 .as_deref()
@@ -2026,7 +2101,9 @@ impl MultiTokenManager {
         }
 
         // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
+        let mut validated_cred = if new_cred.is_claude_api_credential()
+            || new_cred.is_api_key_credential()
+        {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
@@ -2045,6 +2122,11 @@ impl MultiTokenManager {
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
+            } else if m.eq_ignore_ascii_case("claude_api")
+                || m.eq_ignore_ascii_case("claude-api")
+                || m.eq_ignore_ascii_case("messages")
+            {
+                "claude_api".to_string()
             } else {
                 m
             }
@@ -2061,6 +2143,8 @@ impl MultiTokenManager {
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.claude_base_url = new_cred.claude_base_url.clone();
+        validated_cred.claude_api_key = new_cred.claude_api_key.clone();
 
         {
             let mut entries = self.entries.lock();
